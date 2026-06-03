@@ -1,0 +1,70 @@
+# Neutral, domain-agnostic profile — the default for arbitrary PDFs
+# (financial reports, specs, manuals, ...). No Q&A / drawing / clause
+# structure assumptions: the chunker falls back to pure paragraph chunks.
+name: document
+
+answer_framing: "You are a careful assistant answering questions about a set of documents. You must follow these rules without exception:"
+
+ocr_text_prompt: |-
+  You are extracting text from a single page of a document.
+
+  Return ONLY the extracted text, preserving:
+  - Paragraph breaks (blank line between paragraphs).
+  - Section / heading lines (keep on their own lines).
+  - Tables: render as plain text with column separators (use " | ") and one row per line.
+  - Numbering / list markers as printed.
+
+  Do NOT:
+  - Add commentary, summaries, or notes.
+  - Translate any text (keep the original language).
+  - Skip handwritten annotations or stamps — transcribe them inline with a [handwritten: ...] marker.
+  - Describe images / figures; captioning is handled separately.
+
+  If the page is blank or contains no text, return exactly: <empty page>
+
+ocr_drawing_prompt: |-
+  You are extracting structured information from a single page that is a figure, chart, diagram, or table-heavy page of a document.
+
+  Return ONLY a text representation of what is on the page, including:
+  - Any title, label, legend, axis, or caption text — verbatim.
+  - Key values, numbers, units, and data points shown.
+  - Any annotations or handwritten notes — transcribe inline with a [handwritten: ...] marker.
+  - References to other figures, sections, or pages visible on the sheet — verbatim.
+  - Tabular data — render as "key: value" lines or " | "-separated rows.
+
+  Do NOT:
+  - Describe visual style ("a chart of...", "the figure shows...").
+  - Make up content that is not on the page.
+  - Add commentary, summaries, or interpretation.
+  - Translate any text (keep the original language).
+
+  If the page is blank or contains nothing useful, return exactly: <empty page>
+
+# NOTE: keep the literal "{nearby_text}" placeholder and the doubled
+# braces {{...}} — build_caption_prompt() str.format()s this template.
+caption_prompt: |-
+  You are describing a figure, chart, or diagram from a document.
+
+  Output a JSON object with EXACTLY these two keys:
+    "caption_zh": 80-200 字的中文图说。描述这张图/图表的主题、关键数据/数值/结构、与其他内容的关联。直接说内容，不要"这张图""图中显示"之类的废话开头。
+    "entities": 字符串列表（list[str]），图上出现的编号、引用、关键术语和关键数值。
+
+  The nearby OCR'd text is provided for grounding:
+  <nearby_text>
+  {nearby_text}
+  </nearby_text>
+
+  Return ONLY a single JSON object. No markdown code fences. No commentary. No prose before or after the JSON.
+  If the image is not actually a figure or is unreadable, return: {{"caption_zh": "", "entities": []}}
+
+# No domain structure → chunker uses paragraph fallback, empty tender fields.
+structure:
+  qa_block_pattern: null
+  section_header_pattern: null
+  clause_header_pattern: null
+  ref_rules: []
+
+suggested_questions:
+  - "这份文档的主要内容是什么？"
+  - "有哪些关键的日期、金额或数值？"
+  - "谁是相关的责任方或签署方？"

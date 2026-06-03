@@ -1,0 +1,80 @@
+# Generated from the live construction constants (Phase 7 SS1).
+# The SS1 byte-equality test guarantees this matches the source modules.
+name: contract
+answer_framing: 'You are a careful assistant answering questions about a construction contract (a civil engineering project). You must follow these rules without exception:'
+ocr_text_prompt: 'You are extracting text from a single page of a construction tender contract PDF.
+
+
+  Return ONLY the extracted text, preserving:
+
+  - Paragraph breaks (blank line between paragraphs).
+
+  - Section / Clause headers (keep on their own lines).
+
+  - "Question No.:" and "Answer:" markers exactly as printed.
+
+  - Drawing No. references (e.g. T/PRJ/CWD/WS/2101A) verbatim.
+
+  - Revision markers (Rev A, Revision 0, etc.).
+
+  - Tables: render as plain text with column separators (use " | ") and one row per line.
+
+
+  Do NOT:
+
+  - Add commentary, summaries, or notes.
+
+  - Translate any text (keep English as English).
+
+  - Skip handwritten annotations or stamps — transcribe them inline with a [handwritten: ...] marker.
+
+  - Describe images / drawings; the next ingest sub-sprint handles vision captioning separately.
+
+
+  If the page is blank or contains no text, return exactly: <empty page>'
+ocr_drawing_prompt: 'You are extracting structured information from a single page of an engineering drawing from a construction tender contract PDF.
+
+
+  Return ONLY a text representation of the drawing, including:
+
+  - Title block: drawing title, Drawing No. (e.g. T/PRJ/CWD/WS/2101A), revision (Rev A, Revision 0), scale, date.
+
+  - Key labels and dimensions visible on the drawing (numeric callouts, area markers, distances, materials).
+
+  - Any annotations or handwritten notes — transcribe them inline with a [handwritten: ...] marker.
+
+  - Drawing No. references to other drawings (verbatim, e.g. T/PRJ/CWD/WS/2101A).
+
+  - Section / Clause references visible on the sheet (e.g. Clause 7.3).
+
+  - Tabular data on the sheet (legends, schedules, revision history) — render as "key: value" lines, one entry per line.
+
+
+  Do NOT:
+
+  - Describe visual style ("a blueprint of...", "the drawing shows...").
+
+  - Make up content that is not on the page.
+
+  - Add commentary, summaries, or interpretation.
+
+  - Translate any text (keep English as English).
+
+
+  If the page is blank or contains nothing useful, return exactly: <empty page>'
+caption_prompt: "You are describing an engineering drawing from a construction tender PDF.\n\nOutput a JSON object with EXACTLY these two keys:\n  \"caption_zh\": 80-200 字的中文图说。描述这张图的主题、关键尺寸/材料/构造方式、与其他图的关联。直接说内容，不要\"这张图\"\"图中显示\"之类的废话开头。\n  \"entities\": 字符串列表（list[str]），drawing 上出现的 Drawing No. (如 T/PRJ/CWD/WS/2101A)、Clause 引用（如 Clause 7.3）、关键术语和关键尺寸值。\n\nThe drawing's nearby OCR'd text is provided for grounding:\n<nearby_text>\n{nearby_text}\n</nearby_text>\n\nReturn ONLY a single JSON object. No markdown code fences. No commentary. No prose before or after the JSON.\nIf the image is not actually a drawing or is unreadable, return: {{\"caption_zh\": \"\", \"entities\": []}}"
+structure:
+  qa_block_pattern: ^\s*Question\s*No[.:]?\s*[:.]?\s*([\w/\-]+)
+  section_header_pattern: ^\s*(Section\s+\d+[A-Z]?)\b
+  clause_header_pattern: ^\s*(Clause\s+\d+(?:\.\d+)*)\b
+  ref_rules:
+  - pattern: (?:Drawing\s*No\.?\s*|Dwg\.?\s*)([\w/\-]+/\d+[A-Z]?)
+    target_field: drawing_refs
+  - pattern: (?:Clause|Cl\.?)\s+(\d+(?:\.\d+)*)
+    target_field: clause_refs
+suggested_questions:
+- 谁来负责这座桥梁的建造？
+- TSA 的 platform level 有什么特殊要求？
+- M&E raiser 有什么要求？
+- tender clarification 是什么时候交的？谁交的？
+- DES 屋顶有什么要求？

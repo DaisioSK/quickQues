@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# ============================================================
+# Pre-commit hook: secret leak guard
+# ============================================================
+# Install: bash scripts/install-hooks.sh
+# Per docs/project_guideline.md §6.1 and dev-contract/21-domain-security.md
+# §Secret 管理.
+#
+# Greps staged additions for common secret patterns and aborts commit on hit.
+# False positives can be bypassed with `git commit --no-verify`, but that
+# requires explicit human override (and ought to be documented).
+# ============================================================
+
+set -euo pipefail
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR || true)
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+# Dump only added lines from the staged diff. We skip "+++" header lines
+# by requiring the second char to not be another "+".
+ADDED_LINES=$(git diff --cached --diff-filter=ACMR -U0 | grep -E '^\+[^+]' || true)
+if [ -z "$ADDED_LINES" ]; then
+    exit 0
+fi
+
+# Patterns that should never appear in committed code.
+# Keep specific; avoid leading dashes in patterns (grep arg parsing).
+PATTERNS=(
+    'sk-ant-api[0-9]{2}'                  # Anthropic key
+    'sk-[A-Za-z0-9_-]{30,}'               # OpenAI / DeepSeek style
+    'llx-[A-Za-z0-9]{30,}'                # LlamaIndex Cloud
+    'AKIA[0-9A-Z]{16}'                    # AWS access key id
+    'ghp_[A-Za-z0-9]{36}'                 # GitHub PAT
+    'BEGIN [A-Z ]*PRIVATE KEY'            # PEM private keys (any flavor)
+)
+
+HIT=0
+for pattern in "${PATTERNS[@]}"; do
+    matches=$(printf '%s\n' "$ADDED_LINES" | grep -E -- "$pattern" || true)
+    if [ -n "$matches" ]; then
+        echo "✗ Secret-like pattern detected: $pattern"
+        printf '%s\n' "$matches" | head -3
+        HIT=1
+    fi
+done
+
+if [ "$HIT" -ne 0 ]; then
+    echo ""
+    echo "Commit blocked by pre-commit secret guard."
+    echo "If this is a false positive, document why and rerun with --no-verify."
+    exit 1
+fi
+
+exit 0

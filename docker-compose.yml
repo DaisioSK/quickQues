@@ -1,0 +1,50 @@
+# ============================================================
+# j-contract docker-compose (Phase 0 S0.3 skeleton)
+# ============================================================
+# Two services: qdrant (vector DB) + app (placeholder Python container).
+# Replaced/extended in Phase 5 when FastAPI is wired.
+#
+# FORESHADOW-0.3.2: this file uses compose-file format 3.8 to stay
+# compatible with the dev workstation's docker-compose v1.29.2.
+# Production deploy should run docker compose v2 (CLI plugin) and may
+# adopt v3.9+ syntax (e.g. `env_file: { required: false }`).
+# ============================================================
+
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: jcontract-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"  # HTTP API
+      - "6334:6334"  # gRPC
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    # Bash TCP check works inside the qdrant debian-slim image; cheap and
+    # has no external dep on wget/curl being present.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jcontract-app:0.1.0
+    container_name: jcontract-app
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./input-docs:/app/input-docs:ro
+      - ./data:/app/data

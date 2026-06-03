@@ -1,0 +1,59 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ----- Virtual environments -----
+.venv/
+venv/
+env/
+
+# ----- Secrets -----
+.env
+.env.local
+.env.*.local
+
+# ----- IDE / OS -----
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ----- Project artifacts (never commit pipeline outputs) -----
+data/*
+!data/.gitkeep
+
+# ----- Project inputs (PDFs are large + may be confidential) -----
+# Force-add specific files with `git add -f` if needed.
+input-docs/**/*.pdf
+input-docs/**/*.PDF
+
+# ----- WeChat reference screenshots in repo root (legacy) -----
+/*.pic.jpg
+
+# ----- uv -----
+# uv.lock IS committed per DECISION-0.2.1.
+# Caches are not.
+.uv_cache/
+/.claude/
+
+# ----- web/ (Next.js frontend, sub-sprint p5-s2-ssNextInit) -----
+# package-lock.json IS committed for reproducible installs (Node analog
+# of uv.lock). node_modules / build artifacts / test caches are not.
+web/node_modules/
+web/.next/
+web/coverage/
+web/.turbo/
+web/out/
