@@ -103,6 +103,31 @@ def test_fastembed_dim_matches(embedder: FastEmbedEmbedder) -> None:
     assert embedder.dim == _MODEL_DIMS[DEFAULT_MODEL]
 
 
+def test_fastembed_cache_dir_persistent_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cache resolves to ~/.cache/fastembed, NOT the reboot-wiped tempdir.
+
+    # Why: fastembed's own default is <tempdir>/fastembed_cache — every
+    # reboot then re-downloads ~1GB of weights (P1Fixes 2026-06-10).
+    """
+    import tempfile
+
+    from jcontract.impls.fastembed_embedder import _resolve_cache_dir
+
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    resolved = _resolve_cache_dir()
+    assert "fastembed" in resolved
+    assert not resolved.startswith(tempfile.gettempdir())
+    assert ".cache" in resolved
+
+
+def test_fastembed_cache_dir_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FASTEMBED_CACHE_PATH wins over the built-in default when set."""
+    from jcontract.impls.fastembed_embedder import _resolve_cache_dir
+
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", "/custom/model-cache")
+    assert _resolve_cache_dir() == "/custom/model-cache"
+
+
 def test_fastembed_deterministic(embedder: FastEmbedEmbedder) -> None:
     """Same input → byte-identical vector across two calls.
 
@@ -397,3 +422,38 @@ def test_qdrant_point_uuid_deterministic() -> None:
     """uuid5 mapping is stable across calls — pure-Python sanity test."""
     assert _point_uuid("doc.pdf:1:0") == _point_uuid("doc.pdf:1:0")
     assert _point_uuid("a") != _point_uuid("b")
+
+
+# --------------------------------------------------------------------------- #
+# _build_stack BM25 degradation warning (P1Fixes 2026-06-10)
+# --------------------------------------------------------------------------- #
+
+
+def test_build_stack_warns_on_missing_snapshot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Snapshot empty + Qdrant non-empty → loud bm25_snapshot_missing warning.
+
+    # Why: hybrid silently degrading to vector-only burned a multi-day eval
+    # run (2026-06-08); the warning is the regression guard for that.
+    """
+    from jcontract import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_chunks_snapshot", lambda _p: [])
+    monkeypatch.setattr(QdrantStore, "count", lambda self: 7)
+    cli_mod._build_stack("ghost-collection")
+    out = capsys.readouterr().out
+    assert "bm25_snapshot_missing" in out
+    assert "ghost-collection" in out
+
+
+def test_build_stack_quiet_on_fresh_collection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Snapshot empty + Qdrant empty (fresh collection) → no warning noise."""
+    from jcontract import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "load_chunks_snapshot", lambda _p: [])
+    monkeypatch.setattr(QdrantStore, "count", lambda self: 0)
+    cli_mod._build_stack("fresh-collection")
+    assert "bm25_snapshot_missing" not in capsys.readouterr().out

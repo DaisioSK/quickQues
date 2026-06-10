@@ -37,6 +37,8 @@ Context:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import ClassVar
 
 # Why type: ignore: fastembed ships no py.typed marker (as of 0.4). The
@@ -58,12 +60,27 @@ _MODEL_DIMS: dict[str, int] = {
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 
+def _resolve_cache_dir() -> str:
+    """Model cache location: ``$FASTEMBED_CACHE_PATH`` or ``~/.cache/fastembed``.
+
+    # What: always pass an explicit, home-anchored cache_dir to fastembed.
+    # Why:  the pinned fastembed defaults to ``<tempdir>/fastembed_cache``
+    #       (/tmp on Linux) when cache_dir is omitted — wiped on reboot, so
+    #       every reboot re-downloads ~1GB+ of ONNX weights. ~/.cache is the
+    #       XDG-standard persistent cache: survives reboots, outside any git
+    #       repo, shared across venvs/projects.
+    # Context: 2026-06-10 P1Fixes — a reboot cost a 25-min re-download mid-eval.
+    """
+    return os.environ.get("FASTEMBED_CACHE_PATH") or str(Path.home() / ".cache" / "fastembed")
+
+
 class FastEmbedEmbedder:
     """ONNX multilingual embedder. Implements the ``Embedder`` Protocol.
 
     First call to ``embed()`` triggers an automatic model download (~1GB
-    for the default model) into ``~/.cache/fastembed/``. Subsequent calls
-    are cache hits and only pay tokenization + ONNX inference cost.
+    for the default model) into ``_resolve_cache_dir()`` (defaults to
+    ``~/.cache/fastembed/``). Subsequent calls are cache hits and only pay
+    tokenization + ONNX inference cost.
     """
 
     # Class-level marker so callers can detect impl identity without isinstance
@@ -92,7 +109,7 @@ class FastEmbedEmbedder:
 
     def _ensure_model(self) -> TextEmbedding:
         if self._model is None:
-            self._model = TextEmbedding(model_name=self._model_name)
+            self._model = TextEmbedding(model_name=self._model_name, cache_dir=_resolve_cache_dir())
         return self._model
 
     def embed(self, texts: list[str]) -> list[list[float]]:

@@ -95,10 +95,31 @@ def _build_stack(collection: str, *, use_reranker: bool = False) -> Stack:
             hint="found pre-Phase-7 flat data/ files; run `jcontract migrate-layout` "
             "to move them into data/<collection>/ (otherwise this collection looks empty)",
         )
-    cached = load_chunks_snapshot(paths_for(collection).chunks_snapshot)
+    snapshot_path = paths_for(collection).chunks_snapshot
+    cached = load_chunks_snapshot(snapshot_path)
     if cached:
         keyword_index.add(cached)
         logger.info("cli.bm25_rehydrated", chunks=len(cached))
+    else:
+        # What: shout when BM25 has nothing to rehydrate but Qdrant holds
+        #       vectors — hybrid retrieval silently degrades to vector-only.
+        # Why:  exactly this bit us on 2026-06-08 (recall report ran for days
+        #       on vector-only without anyone noticing). A fresh/empty
+        #       collection is fine and stays quiet; Qdrant being unreachable
+        #       must not block stack construction, hence the broad except.
+        try:
+            indexed = vector_store.count()
+        except Exception:  # noqa: BLE001 — health is checked elsewhere
+            indexed = 0
+        if indexed > 0:
+            logger.warning(
+                "cli.bm25_snapshot_missing",
+                collection=collection,
+                expected_path=str(snapshot_path),
+                qdrant_points=indexed,
+                hint="hybrid retrieval degraded to vector-only; restore the "
+                "snapshot or re-ingest so BM25 can rehydrate",
+            )
 
     reranker = None
     if use_reranker:
