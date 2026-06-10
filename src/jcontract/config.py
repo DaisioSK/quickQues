@@ -76,3 +76,29 @@ def get_llama_cloud_api_key() -> str:
 def get_qdrant_api_key() -> str | None:
     """Qdrant API key — optional for self-hosted local dev."""
     return os.environ.get("QDRANT_API_KEY") or None
+
+
+# ----- Local / self-hosted LLM (OpenAI-compatible endpoint) -----
+# Used by impls/openai_compat_answerer.py (`--answerer local`). All three
+# are optional with safe LOCAL defaults: out of the box this points at an
+# Ollama server on localhost — no data egress, no real key required.
+
+
+def get_local_llm_base_url() -> str:
+    """Base URL of the OpenAI-compatible endpoint (default: local Ollama)."""
+    return _optional_env("JCONTRACT_LOCAL_LLM_BASE_URL", "http://localhost:11434/v1")
+
+
+def get_local_llm_model() -> str:
+    """Model id served by the local endpoint."""
+    return _optional_env("JCONTRACT_LOCAL_LLM_MODEL", "qwen3:14b")
+
+
+def get_local_llm_api_key() -> str:
+    """API key for the OpenAI-compatible endpoint.
+
+    Ollama ignores the key entirely, but the openai SDK refuses an empty
+    one — hence the non-secret placeholder default. Point this at a real
+    key only when targeting a remote compat endpoint that authenticates.
+    """
+    return _optional_env("JCONTRACT_LOCAL_LLM_API_KEY", "ollama")

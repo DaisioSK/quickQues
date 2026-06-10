@@ -160,6 +160,9 @@ def _maybe_build_answerer(
                       uses Claude Code subscription quota — no per-call $$)
       - codex-cli   : `codex` CLI via subprocess (needs `codex login`,
                       uses ChatGPT Plus/Pro subscription quota)
+      - local       : any OpenAI-compatible endpoint, default local Ollama
+                      (JCONTRACT_LOCAL_LLM_BASE_URL / _MODEL / _API_KEY;
+                      zero cost, zero data egress)
     """
     if backend == "claude-api":
         if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -178,8 +181,16 @@ def _maybe_build_answerer(
         from jcontract.impls.codex_cli_answerer import CodexCliAnswerer
 
         return CodexCliAnswerer(domain_framing=domain_framing)
+    if backend == "local":
+        # No env check — every JCONTRACT_LOCAL_LLM_* var has a safe local
+        # default (Ollama on localhost). Endpoint problems surface at call
+        # time as the graceful fallback answer, not at construction.
+        from jcontract.impls.openai_compat_answerer import OpenAICompatAnswerer
+
+        return OpenAICompatAnswerer(domain_framing=domain_framing)
     raise typer.BadParameter(
-        f"Unknown answerer backend '{backend}'. Choose from: claude-api, claude-cli, codex-cli."
+        f"Unknown answerer backend '{backend}'. "
+        "Choose from: claude-api, claude-cli, codex-cli, local."
     )
 
 
@@ -427,8 +438,9 @@ def evaluate(
         typer.Option(
             help=(
                 "Answerer backend: claude-api (per-token via API key), "
-                "claude-cli (Claude Code subscription quota), or "
-                "codex-cli (ChatGPT subscription quota)."
+                "claude-cli (Claude Code subscription quota), "
+                "codex-cli (ChatGPT subscription quota), or "
+                "local (OpenAI-compatible endpoint, default local Ollama)."
             ),
         ),
     ] = "claude-api",

@@ -84,6 +84,15 @@ bash scripts/check.sh         # quality gate: ruff + mypy + pytest
 (citations, no LLM-written answer), or you can point the answerer at a Claude Code / Codex
 CLI subscription (zero API key) via `JCONTRACT_ANSWERER_BACKEND`.
 
+### Answerer backends
+
+| Backend (`--answerer` / `JCONTRACT_ANSWERER_BACKEND`) | Runs on | Env vars (default) |
+|---|---|---|
+| `claude-api` (default) | Anthropic API, per-token | `ANTHROPIC_API_KEY` (required) |
+| `claude-cli` | `claude` CLI, Claude Code subscription quota | none (needs `claude login`) |
+| `codex-cli` | `codex` CLI, ChatGPT subscription quota | none (needs `codex login`) |
+| `local` | any OpenAI-compatible endpoint — Ollama / vLLM / LM Studio; zero cost and zero data egress when local | `JCONTRACT_LOCAL_LLM_BASE_URL` (`http://localhost:11434/v1`), `JCONTRACT_LOCAL_LLM_MODEL` (`qwen3:14b`), `JCONTRACT_LOCAL_LLM_API_KEY` (`ollama` — placeholder, Ollama ignores it) |
+
 ### Run the app
 
 ```bash
