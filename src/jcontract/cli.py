@@ -643,6 +643,7 @@ def batch_ingest(
     # One parser shared across the batch — its OCR cache is content-addressed
     # so it's safe across multiple PDFs AND across parser backends (each vendor
     # uses its own cache filename prefix to avoid cross-vendor pollution).
+    from jcontract.impls._pdfium_render import render_pdf_page_jpeg
     from jcontract.impls.claude_cli_vision_parser import ClaudeCliVisionParser
     from jcontract.impls.claude_vision_parser import ClaudeVisionParser
     from jcontract.impls.deepseek_v4_parser import DeepSeekV4Parser
@@ -689,24 +690,26 @@ def batch_ingest(
         f"concurrent={max_concurrent}, budget={max_budget_usd or 'unlimited'} USD"
     )
 
-    # `_ocr_page` is the parser's per-page worker; we wrap it for the
-    # batch orchestrator. asyncio.to_thread keeps the sync render + API
-    # call off the event loop without blocking other workers.
+    # Per-page worker for the batch orchestrator. asyncio.to_thread keeps
+    # the sync render + API call off the event loop without blocking other
+    # workers. Render goes through `render_pdf_page_jpeg` — the only
+    # thread-safe pdfium entry point (open→render→close inside the global
+    # pdfium lock) — then `_ocr_jpeg` (cache check + vendor call, no
+    # pdfium) runs concurrently. [DECISION-ab3.46]
     async def ocr_one_page(pdf_path: Path, page_num: int) -> tuple[str, float]:
         def sync_ocr() -> tuple[str, float]:
-            # Open the PDF per call — pdfium.PdfDocument is not thread-safe
-            # (see batch.py UNCERTAIN noted by ssA).
-            pdf = pdfium.PdfDocument(str(pdf_path))
-            try:
-                page = pdf[page_num - 1]
-                text = parser_impl._ocr_page(page, page_num, pdf_path.name)
-                # Conservative cost estimate — overcounts cached pages but
-                # that's safer for a budget guard. Actual subscription users
-                # see this as informational; API-key users get real billing.
-                cost = estimated_cost_per_page if text else 0.0
-                return text, cost
-            finally:
-                pdf.close()
+            jpeg = render_pdf_page_jpeg(
+                pdf_path,
+                page_num,
+                dpi=parser_impl._dpi,
+                jpeg_quality=parser_impl._jpeg_quality,
+            )
+            text = parser_impl._ocr_jpeg(jpeg, page_num, pdf_path.name)
+            # Conservative cost estimate — overcounts cached pages but
+            # that's safer for a budget guard. Actual subscription users
+            # see this as informational; API-key users get real billing.
+            cost = estimated_cost_per_page if text else 0.0
+            return text, cost
 
         return await asyncio.to_thread(sync_ocr)
 

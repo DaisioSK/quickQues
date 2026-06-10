@@ -46,6 +46,7 @@ from PIL import Image, ImageFilter, ImageStat
 
 from jcontract.config import get_anthropic_api_key
 from jcontract.impls._ocr_cache_key import model_cache_suffix
+from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.interfaces import DomainProfile, ParsedPage
 
 logger = structlog.get_logger(__name__)
@@ -341,19 +342,27 @@ class ClaudeVisionParser:
             pdf.close()
 
     def _ocr_page(self, page: pdfium.PdfPage, page_num: int, pdf_name: str) -> str:
-        """Render one page, check cache, call Vision if miss, return text."""
-        # Render to PIL Image. pypdfium2 uses 72 DPI as the unit "1.0"; scale
-        # accordingly so we hit our target rasterization density.
-        scale = self._dpi / 72.0
-        pil_image = page.render(scale=scale).to_pil()
+        """Render one page, check cache, call Vision if miss, return text.
 
-        # JPEG-encode to bytes (used both as the API payload and as the cache key).
-        # Quality=85 keeps text legible; lower values introduce JPEG ringing that
-        # hurts OCR (see reference/claude-vision-ocr.md "Image format choices").
-        buf = io.BytesIO()
-        pil_image.save(buf, format="JPEG", quality=self._jpeg_quality)
-        jpeg_bytes = buf.getvalue()
+        Sequential entry point (parse loop). Concurrent callers
+        (batch-ingest) render via ``render_pdf_page_jpeg`` themselves and
+        call ``_ocr_jpeg`` directly — see DECISION-ab3.46.
+        """
+        # Render via the shared serialized helper (JPEG bytes are both the
+        # API payload and the cache key — concurrency-deterministic,
+        # DECISION-ab3.46). Quality=85 keeps text legible; lower values
+        # introduce JPEG ringing that hurts OCR (see
+        # reference/claude-vision-ocr.md "Image format choices").
+        jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
+        return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
 
+    def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
+        """Classify + cache-check + Vision call for pre-rendered JPEG bytes.
+
+        Touches no pdfium state — safe to call from any thread. Signature
+        matches ClaudeCliVisionParser/DeepSeekV4Parser so cli.py
+        batch-ingest can dispatch to any vendor uniformly.
+        """
         # Decide which prompt to use. When auto_classify is off we
         # preserve the Phase 1.5 single-prompt behaviour exactly.
         # Defensive: if a caller monkey-patches `_classify` with a

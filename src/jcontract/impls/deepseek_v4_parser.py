@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import logging
 from pathlib import Path
 from typing import ClassVar
@@ -46,6 +45,7 @@ from openai import OpenAI
 
 from jcontract.config import get_deepseek_api_key
 from jcontract.impls._ocr_cache_key import model_cache_suffix
+from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.impls.claude_vision_parser import (
     DRAWING_CAPTION_PROMPT,
     EMPTY_PAGE_SENTINEL,
@@ -187,17 +187,22 @@ class DeepSeekV4Parser:
         """Render one page, check cache, call Vision if miss, return text.
 
         Signature matches ClaudeVisionParser._ocr_page so cli.py batch-ingest
-        can dispatch to either vendor uniformly.
+        can dispatch to either vendor uniformly. Sequential entry point
+        (parse loop); concurrent callers render via ``render_pdf_page_jpeg``
+        and call ``_ocr_jpeg`` directly — see DECISION-ab3.46.
         """
-        # Render to PIL Image. pypdfium2 uses 72 DPI as unit "1.0".
-        scale = self._dpi / 72.0
-        pil_image = page.render(scale=scale).to_pil()
+        # Render via the shared serialized helper — JPEG bytes are payload
+        # AND cache key (concurrency-deterministic, DECISION-ab3.46).
+        jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
+        return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
 
-        # JPEG-encode to bytes — payload AND cache key.
-        buf = io.BytesIO()
-        pil_image.save(buf, format="JPEG", quality=self._jpeg_quality)
-        jpeg_bytes = buf.getvalue()
+    def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
+        """Classify + cache-check + Vision call for pre-rendered JPEG bytes.
 
+        Touches no pdfium state — safe to call from any thread. Signature
+        matches the Claude vendors so cli.py batch-ingest can dispatch to
+        any vendor uniformly.
+        """
         # Classify before cache lookup so the cache key matches the prompt
         # actually used. If the classifier raises (user-patched broken
         # impl), fall back to "text" — same belt-and-braces as

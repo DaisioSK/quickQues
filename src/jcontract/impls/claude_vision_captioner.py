@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import logging
 from pathlib import Path
 from typing import ClassVar
@@ -219,16 +218,15 @@ def render_page_to_jpeg(pdf_path: Path, page_num: int, dpi: int = 150) -> bytes:
     # Local imports — keeps top-of-file imports lean for callers that
     # only need the captioner class.
     import pypdfium2 as pdfium
-    from PIL import Image  # noqa: F401  # ensure Pillow loaded for save()
+
+    from jcontract.impls._pdfium_render import render_page_jpeg
 
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
-        # 1-indexed external API ↔ 0-indexed pypdfium2.
+        # 1-indexed external API ↔ 0-indexed pypdfium2. Render goes
+        # through the shared lock (concurrency-deterministic JPEG bytes,
+        # DECISION-ab3.46).
         page = pdf[page_num - 1]
-        scale = dpi / 72.0
-        pil_image = page.render(scale=scale).to_pil()
-        buf = io.BytesIO()
-        pil_image.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
+        return render_page_jpeg(page, dpi=dpi, jpeg_quality=85)
     finally:
         pdf.close()

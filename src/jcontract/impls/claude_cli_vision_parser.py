@@ -32,7 +32,6 @@ Cost vs ClaudeVisionParser (API direct):
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
 import shutil
 from pathlib import Path
@@ -43,6 +42,7 @@ import structlog
 
 from jcontract.impls._claude_cli_runner import run_claude_read_image
 from jcontract.impls._ocr_cache_key import model_cache_suffix
+from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.interfaces import DomainProfile, ParsedPage
 
 logger = structlog.get_logger(__name__)
@@ -167,16 +167,26 @@ class ClaudeCliVisionParser:
             pdf.close()
 
     def _ocr_page(self, page: pdfium.PdfPage, page_num: int, pdf_name: str) -> str:
-        """Render one page, check cache, call claude CLI if miss, return text."""
+        """Render one page, check cache, call claude CLI if miss, return text.
+
+        Sequential entry point (parse loop). Concurrent callers
+        (batch-ingest) render via ``render_pdf_page_jpeg`` themselves and
+        call ``_ocr_jpeg`` directly — see DECISION-ab3.46.
+        """
         # Same render path as ClaudeVisionParser — same JPEG bytes → same
-        # cache key → cross-parser cache compatibility.
-        scale = self._dpi / 72.0
-        pil_image = page.render(scale=scale).to_pil()
+        # cache key → cross-parser cache compatibility. Render goes through
+        # the shared lock so JPEG bytes match what concurrent batch-ingest
+        # workers produce (cache-key determinism, DECISION-ab3.46).
+        jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
+        return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
 
-        buf = io.BytesIO()
-        pil_image.save(buf, format="JPEG", quality=self._jpeg_quality)
-        jpeg_bytes = buf.getvalue()
+    def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
+        """Cache-check + claude CLI call for pre-rendered JPEG bytes.
 
+        Touches no pdfium state — safe to call from any thread. Signature
+        matches ClaudeVisionParser/DeepSeekV4Parser so cli.py batch-ingest
+        can dispatch to any vendor uniformly.
+        """
         cache_key = hashlib.sha256(jpeg_bytes).hexdigest()
         # Tag with "text" prompt kind to match ClaudeVisionParser's cache
         # layout post-Phase-1.7-ssB (drawing detection cache splits).
