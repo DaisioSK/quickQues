@@ -160,6 +160,48 @@ def test_fastembed_rejects_unknown_model() -> None:
         FastEmbedEmbedder(model_name="not-a-real-model")
 
 
+def test_bge_m3_in_whitelist_and_lazy() -> None:
+    """bge-m3 constructs lazily with dim=1024 — no download at __init__.
+
+    # Why: the whitelist hard-codes dims so VectorStore can size a
+    # collection before any 2.27GB model download (ssA2, DECISION-ab3.1).
+    """
+    assert _MODEL_DIMS["BAAI/bge-m3"] == 1024
+    embedder = FastEmbedEmbedder(model_name="BAAI/bge-m3")
+    assert embedder.dim == 1024
+    assert embedder.model_name == "BAAI/bge-m3"
+    # Lazy contract: the TextEmbedding instance must not exist yet —
+    # building it would trigger the ONNX download.
+    assert embedder._model is None
+
+
+def test_bge_m3_registered_in_fastembed() -> None:
+    """Importing the module registers bge-m3 in fastembed's model registry."""
+    from fastembed import TextEmbedding
+
+    registry = {m["model"]: m for m in TextEmbedding.list_supported_models()}
+    assert "BAAI/bge-m3" in registry
+    desc = registry["BAAI/bge-m3"]
+    assert desc["dim"] == 1024
+    assert desc["sources"]["hf"] == "BAAI/bge-m3"
+    assert desc["model_file"] == "onnx/model.onnx"
+    # External ONNX weights must be in the download allow-list, or the
+    # graph would fail to load at runtime.
+    assert "onnx/model.onnx_data" in desc["additional_files"]
+
+
+def test_bge_m3_registration_idempotent() -> None:
+    """Re-running the module-level registration must be a no-op, not a raise.
+
+    # Why: fastembed's add_custom_model raises ValueError on duplicates;
+    # the guard makes repeated imports (pytest, importlib.reload) safe.
+    """
+    from jcontract.impls.fastembed_embedder import _register_bge_m3
+
+    _register_bge_m3()  # module import already ran it once
+    _register_bge_m3()
+
+
 # --------------------------------------------------------------------------- #
 # Bm25Index
 # --------------------------------------------------------------------------- #

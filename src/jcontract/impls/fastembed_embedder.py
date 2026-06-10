@@ -25,9 +25,10 @@ Why this specific model (DECISION):
     For Phase 1 prototype we default to ``paraphrase-multilingual-mpnet-
     base-v2``: it preserves the 768-dim contract from the spec, keeps the
     multilingual coverage, and avoids the 2.24GB e5-large download on a
-    fresh dev box. The Embedder Protocol allows swap at runtime, so a
-    future Phase 2 sub-sprint can upgrade to bge-m3 (also 1024-dim) with
-    only a config flip.
+    fresh dev box. The Embedder Protocol allows swap at runtime: e5-large
+    is built in, and BAAI/bge-m3 (1024-dim) is registered below as a
+    fastembed custom model [DECISION-ab3.1 dev-sprint v3 §13] — select via
+    JCONTRACT_EMBED_MODEL.
 
 Context:
     Phase 1 S1.1 ssB. Consumed by ingest/pipeline.py (integrator) and by
@@ -41,10 +42,10 @@ import os
 from pathlib import Path
 from typing import ClassVar
 
-# Why type: ignore: fastembed ships no py.typed marker (as of 0.4). The
-# Embedder Protocol boundary here is fully typed (list[list[float]]) so the
-# untyped third-party only leaks at this single import; suppress narrowly.
-from fastembed import TextEmbedding  # type: ignore[import-untyped]
+# Note: fastembed 0.3.x shipped no py.typed marker and needed a narrow
+# `type: ignore[import-untyped]` here; 0.8.0 is typed, so imports are clean.
+from fastembed import TextEmbedding
+from fastembed.common.model_description import ModelSource, PoolingType
 
 # Why a curated whitelist with hard-coded dims:
 #   fastembed exposes ``list_supported_models()`` at runtime, but loading
@@ -55,9 +56,66 @@ _MODEL_DIMS: dict[str, int] = {
     "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": 768,
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
     "intfloat/multilingual-e5-large": 1024,
+    "BAAI/bge-m3": 1024,
 }
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+
+
+def _register_bge_m3() -> None:
+    """Register BAAI/bge-m3 (dense) as a fastembed custom model. Idempotent.
+
+    What:
+        fastembed 0.8.0 has no built-in bge-m3 dense model; this registers
+        the official BAAI ONNX export via ``TextEmbedding.add_custom_model``
+        so ``FastEmbedEmbedder(model_name="BAAI/bge-m3")`` just works.
+
+    Why these exact parameters (verified against the HF repo on 2026-06-10):
+        - sources/model_file: the *official* ``BAAI/bge-m3`` repo ships an
+          ``onnx/`` export (graph ``onnx/model.onnx`` + external weights
+          ``onnx/model.onnx_data``, ~2.27GB). Chosen over community exports
+          (aapot/bge-m3-onnx etc.): first-party = no typosquat risk, MIT
+          license, 28M+ downloads. [DECISION-ab3.20 dev-sprint v3 §13]
+        - pooling=CLS + normalization=True: matches the model's own
+          ``1_Pooling/config.json`` (``pooling_mode_cls_token: true``); the
+          ONNX graph's first output is ``token_embeddings`` (B, S, 1024), so
+          fastembed's CLS pooling + normalize reproduces the official dense
+          embedding.
+        - dim=1024: ``config.json`` hidden_size (XLMRobertaModel).
+        - additional_files: only ``onnx/model.onnx_data`` — the sole external
+          file the graph references; keeps the snapshot download from pulling
+          the 2.27GB ``pytorch_model.bin``.
+
+    Why idempotent guard instead of try/except:
+        ``add_custom_model`` raises ValueError on duplicate registration;
+        re-imports (pytest collection, importlib.reload) must not blow up,
+        and swallowing ValueError blindly could mask real config errors.
+
+    Context:
+        EmbedAB3 ssA2 — bge-m3 is the Phase-2 candidate dense model for the
+        embedder A/B eval. [DECISION-ab3.1 dev-sprint v3 §13]
+    """
+    registered = {m["model"] for m in TextEmbedding.list_supported_models()}
+    if "BAAI/bge-m3" in registered:
+        return
+    TextEmbedding.add_custom_model(
+        model="BAAI/bge-m3",
+        pooling=PoolingType.CLS,
+        normalization=True,
+        sources=ModelSource(hf="BAAI/bge-m3"),
+        dim=1024,
+        model_file="onnx/model.onnx",
+        description="Multilingual dense embedding (XLM-RoBERTa), official BAAI ONNX export.",
+        license="mit",
+        size_in_gb=2.27,
+        additional_files=["onnx/model.onnx_data"],
+    )
+
+
+# Module-level: registration only mutates fastembed's in-process model
+# registry (no download, no I/O), so import stays cheap and every consumer
+# of this module sees bge-m3 as available.
+_register_bge_m3()
 
 
 def _resolve_cache_dir() -> str:
