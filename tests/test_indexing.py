@@ -515,3 +515,45 @@ def test_build_stack_embed_model_env_override(monkeypatch: pytest.MonkeyPatch) -
     stack = cli_mod._build_stack("env-override-collection")
     assert stack.embedder.model_name == "intfloat/multilingual-e5-large"
     assert stack.embedder.dim == 1024
+
+
+# --- upsert batching (DECISION-ab3.61) ------------------------------------
+
+
+def test_qdrant_add_batches_large_upserts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """add() must split big point lists into <=256-point upsert requests.
+
+    Regression for the 2026-06-10 full-corpus ingest: a whole-volume
+    single-request upsert (thousands of 1024-dim points, wait=True)
+    timed out against Qdrant on WSL2 disk. No live Qdrant needed — the
+    client is stubbed; we assert the request-splitting contract only.
+    """
+
+    class _RecorderClient:
+        def __init__(self) -> None:
+            self.batches: list[int] = []
+
+        def collection_exists(self, name: str) -> bool:
+            return True
+
+        def upsert(self, collection_name: str, points: list, wait: bool) -> None:
+            assert wait is True
+            self.batches.append(len(points))
+
+    store = QdrantStore(collection_name="batch-test", url="http://127.0.0.1:1")
+    recorder = _RecorderClient()
+    store._client = recorder  # type: ignore[assignment]  # Why: unit-test seam; no live Qdrant
+
+    n = 600
+    chunks = [
+        Chunk(
+            id=f"doc.pdf:1:{i}", text=f"chunk {i}", file="doc.pdf", page=1, chunk_type="paragraph"
+        )
+        for i in range(n)
+    ]
+    vectors = [[0.0, 0.1, 0.2, 0.3] for _ in range(n)]
+
+    store.add(chunks, vectors)
+
+    assert recorder.batches == [256, 256, 88]
+    assert sum(recorder.batches) == n

@@ -54,6 +54,12 @@ from jcontract.interfaces.schema import Chunk, ChunkType, SearchResult
 # collection. uuid4() output captured once for this repo.
 _ID_NAMESPACE = uuid.UUID("8a2f5d8e-7e1c-4d6a-9b3f-1a2b3c4d5e6f")
 
+# Max points per upsert request. 256 × 1024-dim float32 vectors + payload
+# ≈ 1-2 MB per request — comfortably inside the REST timeout even on slow
+# (WSL2) disk; whole-volume single-request upserts timed out.
+# [DECISION-ab3.61 dev-sprint v3 §13]
+_UPSERT_BATCH_SIZE = 256
+
 
 def _point_uuid(chunk_id: str) -> str:
     """Map a domain Chunk.id to a deterministic UUID string."""
@@ -129,9 +135,15 @@ class QdrantStore:
         # Why route through config.py: keeps the env-var contract in one
         # place (project_guideline.md §6.1). Direct kwarg overrides win
         # for tests that need to point at an ephemeral instance.
+        # What: explicit REST timeout (default is just 5s).
+        # Why:  large ``wait=True`` upserts (hundreds of points × 1024-dim
+        #       vectors) exceed 5s under WSL2 disk I/O — observed
+        #       ResponseHandlingException("timed out") on a 625-page volume
+        #       (2026-06-10 full-corpus ingest, [DECISION-ab3.61]).
         self._client = QdrantClient(
             url=url or cfg.qdrant_url,
             api_key=api_key,
+            timeout=120,
         )
 
     @property
@@ -163,11 +175,16 @@ class QdrantStore:
         ]
         # wait=True: prototype prioritizes correctness over throughput.
         # Eval needs to ``add → search`` in the same test without a race.
-        self._client.upsert(
-            collection_name=self._collection,
-            points=points,
-            wait=True,
-        )
+        # Why batched: a whole-volume upsert (thousands of points, tens of
+        # MB) in one request times out even with a generous client timeout;
+        # 256-point batches keep each request small and make progress
+        # incremental. [DECISION-ab3.61 dev-sprint v3 §13]
+        for start in range(0, len(points), _UPSERT_BATCH_SIZE):
+            self._client.upsert(
+                collection_name=self._collection,
+                points=points[start : start + _UPSERT_BATCH_SIZE],
+                wait=True,
+            )
 
     def search(self, query_vector: list[float], k: int) -> list[SearchResult]:
         try:
