@@ -536,7 +536,7 @@ def test_qdrant_add_batches_large_upserts(monkeypatch: pytest.MonkeyPatch) -> No
         def collection_exists(self, name: str) -> bool:
             return True
 
-        def upsert(self, collection_name: str, points: list, wait: bool) -> None:
+        def upsert(self, collection_name: str, points: list[object], wait: bool) -> None:
             assert wait is True
             self.batches.append(len(points))
 
