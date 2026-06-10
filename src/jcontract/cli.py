@@ -22,6 +22,7 @@ from jcontract.eval.compare import compare_reports
 from jcontract.eval.runner import run_eval
 from jcontract.impls.bm25_index import Bm25Index
 from jcontract.impls.domain_profile_registry import load_profile
+from jcontract.impls.fastembed_embedder import DEFAULT_MODEL as EMBED_DEFAULT_MODEL
 from jcontract.impls.fastembed_embedder import FastEmbedEmbedder
 from jcontract.impls.pypdf_parser import PyPdfParser
 from jcontract.impls.qa_chunker import QaAwareChunker
@@ -80,7 +81,17 @@ def _build_stack(collection: str, *, use_reranker: bool = False) -> Stack:
     multi-second first-call latency). Recommended for evals at 4k+ chunk
     scale where vector+BM25 alone gets noisy.
     """
-    embedder = FastEmbedEmbedder()
+    # What: embedding model is env-selectable (JCONTRACT_EMBED_MODEL); the
+    #       whitelist in fastembed_embedder still fail-fasts unknown names.
+    # Why:  A/B-ing dense models (mpnet vs e5-large) needs side-by-side
+    #       collections; a flag through every command signature is heavier
+    #       than one env read at the single construction site (ssEmbedAB).
+    #       Dim mismatches against an existing collection surface loudly as
+    #       Qdrant errors, so a wrong env can't silently cross-query.
+    embed_model = os.environ.get("JCONTRACT_EMBED_MODEL", EMBED_DEFAULT_MODEL)
+    embedder = FastEmbedEmbedder(model_name=embed_model)
+    if embed_model != EMBED_DEFAULT_MODEL:
+        logger.info("cli.embed_model_override", model=embed_model, dim=embedder.dim)
     # QdrantStore infers vector size from the first `add()` batch — no need
     # to pass embedder.dim explicitly (see impls/qdrant_store.py docstring).
     vector_store = QdrantStore(collection_name=collection)

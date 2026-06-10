@@ -457,3 +457,19 @@ def test_build_stack_quiet_on_fresh_collection(
     monkeypatch.setattr(QdrantStore, "count", lambda self: 0)
     cli_mod._build_stack("fresh-collection")
     assert "bm25_snapshot_missing" not in capsys.readouterr().out
+
+
+def test_build_stack_embed_model_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JCONTRACT_EMBED_MODEL switches the dense model; lazy = no download.
+
+    # Why: A/B-ing embedders needs side-by-side collections without code
+    # edits (ssEmbedAB); construction stays lazy so this test is instant.
+    """
+    from jcontract import cli as cli_mod
+
+    monkeypatch.setenv("JCONTRACT_EMBED_MODEL", "intfloat/multilingual-e5-large")
+    monkeypatch.setattr(cli_mod, "load_chunks_snapshot", lambda _p: [])
+    monkeypatch.setattr(QdrantStore, "count", lambda self: 0)
+    stack = cli_mod._build_stack("env-override-collection")
+    assert stack.embedder.model_name == "intfloat/multilingual-e5-large"
+    assert stack.embedder.dim == 1024
