@@ -14,9 +14,15 @@ dependencies = [
     # PDF -> image rendering for OCR (Phase 1.5). pypdfium2 ships pdfium
     # binary in wheels (no system poppler/cairo needed). Apache 2.0.
     "pypdfium2==5.8.0",
-    # Embedding + Vector store — fastembed bundled with qdrant-client uses ONNX,
-    # avoids torch (saves ~2GB) and works on CPU.
-    "qdrant-client[fastembed]==1.12.1",
+    # Embedding + Vector store — fastembed uses ONNX runtime, avoids torch
+    # (saves ~2GB) and works on CPU. Pinned directly (not via the
+    # qdrant-client[fastembed] extra) because qdrant-client 1.12.1 hard-pins
+    # fastembed==0.3.6, which predates TextEmbedding.add_custom_model —
+    # needed to register BAAI/bge-m3 dense. Our code imports fastembed
+    # directly; the qdrant-client integration extra was never used.
+    # [DECISION-ab3.22 dev-sprint v3 §13]
+    "qdrant-client==1.12.1",
+    "fastembed==0.8.0",
     # Keyword search (BM25)
     "rank-bm25==0.2.2",
     # Chinese tokenization for BM25 (jieba is the standard library)
