@@ -69,7 +69,16 @@ class IngestPipeline:
         logger.info("ingest.start", pdf=str(pdf_path))
 
         pages = self.parser.parse(pdf_path)
-        logger.info("ingest.parsed", pages=len(pages), pdf=pdf_path.name)
+        # drawing_pages: how many pages the parser classified as drawings
+        # (ssCL) — these will become chunk_type="drawing" chunks and, when
+        # a captioner is wired, the caption lane's workload. Always 0 for
+        # parsers that can't classify (pypdf).
+        logger.info(
+            "ingest.parsed",
+            pages=len(pages),
+            drawing_pages=sum(1 for p in pages if p.page_kind == "drawing"),
+            pdf=pdf_path.name,
+        )
 
         chunks = self.chunker.chunk(pages, pdf_path.name)
         logger.info("ingest.chunked", chunks=len(chunks), pdf=pdf_path.name)

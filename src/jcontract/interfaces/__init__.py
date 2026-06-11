@@ -30,6 +30,7 @@ from .schema import (
     ChunkType,
     Confidence,
     EvalCase,
+    PageKind,
     ParsedPage,
     SearchResult,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "DrawingCaption",
     "EvalCase",
     "OCRBlock",
+    "PageKind",
     "ParsedPage",
     "RefRule",
     "SearchResult",

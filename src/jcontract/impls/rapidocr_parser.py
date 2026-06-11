@@ -58,8 +58,9 @@ import pypdfium2 as pdfium
 import structlog
 
 from jcontract.impls._ocr_cache_key import model_cache_suffix
+from jcontract.impls._page_classify import _classify_page
 from jcontract.impls._pdfium_render import render_page_jpeg
-from jcontract.interfaces import ParsedPage
+from jcontract.interfaces import PageKind, ParsedPage
 
 logger = structlog.get_logger(__name__)
 
@@ -137,6 +138,7 @@ class RapidOcrParser:
         model_type: str = DEFAULT_MODEL_TYPE,
         max_pages: int | None = None,
         engine: Callable[[bytes], Any] | None = None,
+        auto_classify: bool = True,
     ) -> None:
         # Tests inject a fake ``engine`` callable; production lazily builds
         # the real RapidOCR pipeline on first use (_ensure_engine) so that
@@ -148,6 +150,12 @@ class RapidOcrParser:
         self._jpeg_quality = jpeg_quality
         self._model_type = model_type
         self._max_pages = max_pages
+        # ssCL: page-kind classification (shared text-vs-drawing heuristic)
+        # so drawing pages enter the --caption lane. Unlike the LLM vendors
+        # the verdict does NOT change what this engine OCRs (no prompt) and
+        # does NOT touch the cache key — it only sets ParsedPage.page_kind.
+        # auto_classify=False forces "text" for every page (eval baselines).
+        self._auto_classify = auto_classify
         # RapidOCR's pipeline mutates per-call internal buffers; nothing in
         # the codebase calls this vendor concurrently today (batch-ingest
         # only wires the network vendors), but the lock makes _ocr_jpeg
@@ -209,21 +217,56 @@ class RapidOcrParser:
             pages: list[ParsedPage] = []
             for page_idx in range(page_count):
                 page_num = page_idx + 1  # 1-indexed per ParsedPage contract
-                text = self._ocr_page(pdf[page_idx], page_num, pdf_path.name)
-                pages.append(ParsedPage(page_num=page_num, text=text))
+                pages.append(self._parse_page(pdf[page_idx], page_num, pdf_path.name))
             return pages
         finally:
             pdf.close()
 
-    def _ocr_page(self, page: pdfium.PdfPage, page_num: int, pdf_name: str) -> str:
-        """Render one page via the shared serialized helper, then OCR it.
+    def _parse_page(self, page: pdfium.PdfPage, page_num: int, pdf_name: str) -> ParsedPage:
+        """Render one page via the shared serialized helper, classify + OCR it.
 
         Render goes through the process-global pdfium lock so the JPEG
         bytes — payload AND cache key — are byte-identical to what every
         other vendor produces for the same page (DECISION-ab3.46).
+
+        ssCL: the same rendered JPEG feeds the shared text-vs-drawing
+        heuristic; the verdict is recorded on ``ParsedPage.page_kind`` so
+        the chunker can emit drawing chunks for the --caption lane. OCR
+        text and cache layout are completely unaffected by the verdict.
         """
         jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
-        return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
+        text = self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
+        return ParsedPage(
+            page_num=page_num, text=text, page_kind=self._page_kind(jpeg_bytes, page_num, pdf_name)
+        )
+
+    def _page_kind(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> PageKind:
+        """auto_classify-aware classification with the safe-text fallback.
+
+        Mirrors the LLM vendors' belt-and-braces stance: a raising
+        (monkey-patched) classifier must not lose the page — fall back to
+        "text" and log.
+        """
+        if not self._auto_classify:
+            return "text"
+        try:
+            return self._classify(jpeg_bytes)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "rapidocr_parser.classify_raised_fallback_text",
+                pdf=pdf_name,
+                page=page_num,
+            )
+            return "text"
+
+    def _classify(self, jpeg_bytes: bytes) -> PageKind:
+        """Indirection so tests can monkeypatch classification on the instance.
+
+        Defers to the shared ``_page_classify._classify_page`` heuristic —
+        same calibration thresholds as the Claude/DeepSeek vendors (N=2 /
+        §5.3: tune once, every vendor follows).
+        """
+        return _classify_page(jpeg_bytes)
 
     def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
         """Cache-check + local OCR for pre-rendered JPEG bytes.

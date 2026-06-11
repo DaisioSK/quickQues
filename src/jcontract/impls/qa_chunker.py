@@ -28,6 +28,10 @@ Algorithm (per sub-sprint p1-s1-ssA spec):
        regex; also detect ``Section X`` / ``Clause X.Y`` headers
        appearing immediately before / inside a chunk and record into
        ``section_path``.
+    5. (ssCL) Pages classified ``page_kind="drawing"`` by a vision parser
+       skip steps 1-4 and each becomes a single ``chunk_type="drawing"``
+       chunk — the IngestPipeline's optional VisionCaptioner attaches a
+       caption to exactly these (DECISION-cq.10, docs/dev-sprint.md).
 
 Key DECISIONs (all logged in spec's "关键决策" gate):
     * Max Q&A chunk size: 2000 chars. Longer Q&A bodies are split into
@@ -153,6 +157,20 @@ class QaAwareChunker:
             return []
 
         # ------------------------------------------------------------------
+        # ssCL caption lane (DECISION-cq.10): pages a vision parser
+        # classified as drawings leave the paragraph/Q&A flow entirely and
+        # each becomes ONE chunk_type="drawing" chunk (pass 4 below)
+        # carrying the page's full OCR text. One chunk per page = one
+        # captioner call per page (IngestPipeline._attach_captions renders
+        # + captions per drawing chunk), no double-indexing of the page
+        # text, and the OCR'd title-block labels stay in chunk.text as
+        # captioner context + retrievable text. page_kind defaults to
+        # "text", so every pre-ssCL caller chunks byte-for-byte as before.
+        # ------------------------------------------------------------------
+        text_pages = [p for p in pages if p.page_kind != "drawing"]
+        drawing_pages = [p for p in pages if p.page_kind == "drawing"]
+
+        # ------------------------------------------------------------------
         # Build a flat text + a parallel page-index for every character.
         # We insert a single "\n" between pages so paragraph detection
         # works across page breaks but page-attribution stays exact.
@@ -162,7 +180,7 @@ class QaAwareChunker:
         # concatenated string. Built lazily via running offsets.
         page_starts: list[tuple[int, int]] = []  # (offset, page_num)
         running = 0
-        for page in pages:
+        for page in text_pages:
             page_starts.append((running, page.page_num))
             text_parts.append(page.text)
             running += len(page.text)
@@ -305,6 +323,40 @@ class QaAwareChunker:
                         question_no=question_no,
                         section_path=section_path,
                     )
+
+        # ------------------------------------------------------------------
+        # Pass 4 (ssCL): one drawing chunk per drawing-classified page.
+        # Emitted after the text passes so all-text documents keep their
+        # historical chunk-id sequence untouched; within the pass, pages
+        # go in document order. Unlike emit(), an EMPTY page text still
+        # produces a chunk — a pure-graphic page (no OCR-able labels) is
+        # exactly the page whose only retrievable surface will be the
+        # caption that IngestPipeline._attach_captions adds later.
+        # Cross-reference extraction matches emit() so title-block
+        # Drawing No. / Clause refs feed the RefGraph as usual.
+        # ------------------------------------------------------------------
+        for dp in sorted(drawing_pages, key=lambda p: p.page_num):
+            clean = dp.text.strip()
+            refs: dict[str, list[str]] = {}
+            for rule_re, target_field in self._ref_rules:
+                vals = sorted(set(rule_re.findall(clean)))
+                if vals:
+                    refs[target_field] = vals
+            chunks.append(
+                Chunk(
+                    id=f"{_file_stem(file)}:{dp.page_num}:{chunk_idx}",
+                    text=clean,
+                    file=file,
+                    page=dp.page_num,
+                    chunk_type="drawing",
+                    section_path=None,  # drawings sit outside Section/Clause flow
+                    revision=None,
+                    drawing_refs=refs.get("drawing_refs", []),
+                    clause_refs=refs.get("clause_refs", []),
+                    question_no=None,
+                )
+            )
+            chunk_idx += 1
 
         return chunks
 

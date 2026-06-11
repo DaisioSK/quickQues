@@ -18,6 +18,13 @@ ChunkType = Literal["qa_pair", "table", "paragraph", "drawing"]
 
 Confidence = Literal["high", "medium", "low"]
 
+# Page-level classification produced by vision parsers (ssCL, closes
+# FORESHADOW-ls.4). "drawing" routes the page into the caption lane:
+# the chunker emits a chunk_type="drawing" chunk for it, which the
+# IngestPipeline's optional VisionCaptioner then captions. Parsers that
+# cannot classify (pypdf — no rendered image) leave the default "text".
+PageKind = Literal["text", "drawing"]
+
 
 @dataclass(frozen=True)
 class ParsedPage:
@@ -27,11 +34,19 @@ class ParsedPage:
     order; the chunker decides how to split it. ``tables`` is a list of
     pre-extracted tables in markdown form (empty when parser couldn't
     isolate tables — they will appear inline in ``text``).
+
+    ``page_kind`` (ssCL) carries the vision parsers' text-vs-drawing
+    classification to the chunker so drawing pages can produce
+    chunk_type="drawing" chunks (the --caption lane). The "text" default
+    is the zero-behaviour-change guarantee for every pre-existing
+    construction site (pypdf parser, tests, snapshots): a ParsedPage
+    built without the field chunks exactly as before.
     """
 
     page_num: int  # 1-indexed, matches what the user sees in a PDF reader
     text: str
     tables: list[str] = field(default_factory=list)
+    page_kind: PageKind = "text"
 
 
 @dataclass

@@ -45,15 +45,14 @@ from openai import OpenAI
 
 from jcontract.config import get_deepseek_api_key
 from jcontract.impls._ocr_cache_key import model_cache_suffix
+from jcontract.impls._page_classify import _classify_page
 from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.impls.claude_vision_parser import (
     DRAWING_CAPTION_PROMPT,
     EMPTY_PAGE_SENTINEL,
     TEXT_OCR_PROMPT,
-    PageKind,
-    _classify_page,
 )
-from jcontract.interfaces import DomainProfile, ParsedPage
+from jcontract.interfaces import DomainProfile, PageKind, ParsedPage
 
 logger = structlog.get_logger(__name__)
 
@@ -177,48 +176,70 @@ class DeepSeekV4Parser:
             pages: list[ParsedPage] = []
             for page_idx in range(page_count):
                 page_num = page_idx + 1  # 1-indexed per ParsedPage contract
-                text = self._ocr_page(pdf[page_idx], page_num, pdf_path.name)
-                pages.append(ParsedPage(page_num=page_num, text=text))
+                pages.append(self._parse_page(pdf[page_idx], page_num, pdf_path.name))
             return pages
         finally:
             pdf.close()
 
-    def _ocr_page(self, page: pdfium.PdfPage, page_num: int, pdf_name: str) -> str:
-        """Render one page, check cache, call Vision if miss, return text.
+    def _parse_page(self, page: pdfium.PdfPage, page_num: int, pdf_name: str) -> ParsedPage:
+        """Render one page, classify, OCR (cache-aware), return ParsedPage.
 
-        Signature matches ClaudeVisionParser._ocr_page so cli.py batch-ingest
-        can dispatch to either vendor uniformly. Sequential entry point
+        Mirrors ClaudeVisionParser._parse_page. Sequential entry point
         (parse loop); concurrent callers render via ``render_pdf_page_jpeg``
         and call ``_ocr_jpeg`` directly — see DECISION-ab3.46.
+
+        ssCL: classification happens ONCE here and is passed down to
+        ``_ocr_jpeg`` (prompt routing + cache key) AND recorded on the
+        ParsedPage (``page_kind``) so the chunker can emit drawing chunks
+        for the --caption lane.
         """
         # Render via the shared serialized helper — JPEG bytes are payload
         # AND cache key (concurrency-deterministic, DECISION-ab3.46).
         jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
-        return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
+        page_kind = self._page_kind(jpeg_bytes, page_num, pdf_name)
+        text = self._ocr_jpeg(jpeg_bytes, page_num, pdf_name, page_kind=page_kind)
+        return ParsedPage(page_num=page_num, text=text, page_kind=page_kind)
 
-    def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
+    def _page_kind(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> PageKind:
+        """auto_classify-aware classification with the safe-text fallback.
+
+        Single home for the routing decision so the prompt/cache key (in
+        ``_ocr_jpeg``) and ``ParsedPage.page_kind`` can never diverge. If
+        the classifier raises (user-patched broken impl), fall back to
+        "text" — same belt-and-braces as ClaudeVisionParser.
+        """
+        if not self._auto_classify:
+            return "text"
+        try:
+            return self._classify(jpeg_bytes)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "deepseek_v4_parser.classify_raised_fallback_text",
+                pdf=pdf_name,
+                page=page_num,
+            )
+            return "text"
+
+    def _ocr_jpeg(
+        self,
+        jpeg_bytes: bytes,
+        page_num: int,
+        pdf_name: str,
+        page_kind: PageKind | None = None,
+    ) -> str:
         """Classify + cache-check + Vision call for pre-rendered JPEG bytes.
 
-        Touches no pdfium state — safe to call from any thread. Signature
-        matches the Claude vendors so cli.py batch-ingest can dispatch to
-        any vendor uniformly.
+        Touches no pdfium state — safe to call from any thread. The
+        3-positional-arg signature matches the Claude vendors so cli.py
+        batch-ingest can dispatch to any vendor uniformly. ``page_kind``
+        lets ``_parse_page`` pass its already-computed classification;
+        ``None`` (batch-ingest path) classifies here — same heuristic,
+        same bytes, same verdict.
         """
         # Classify before cache lookup so the cache key matches the prompt
-        # actually used. If the classifier raises (user-patched broken
-        # impl), fall back to "text" — same belt-and-braces as
-        # ClaudeVisionParser._ocr_page.
-        if self._auto_classify:
-            try:
-                page_kind: PageKind = self._classify(jpeg_bytes)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "deepseek_v4_parser.classify_raised_fallback_text",
-                    pdf=pdf_name,
-                    page=page_num,
-                )
-                page_kind = "text"
-        else:
-            page_kind = "text"
+        # actually used.
+        if page_kind is None:
+            page_kind = self._page_kind(jpeg_bytes, page_num, pdf_name)
         prompt = self._drawing_prompt if page_kind == "drawing" else self._text_prompt
 
         # Cache key: vendor prefix + sha256(jpeg) + kind + profile. Vendor
