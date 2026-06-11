@@ -132,6 +132,21 @@ uv run jcontract redact-preview page.redacted.txt --restore --out page.roundtrip
 diff page.txt page.roundtrip.txt   # empty = byte-exact
 ```
 
+### Dispatch plan (`dispatch-plan`)
+
+Deterministic page→provider routing *plan* for multi-vendor corpora — a standalone
+mechanism component (not wired into ingest, zero network): each page's rendered-JPEG
+sha256 picks a provider name from your pool via `hash % pool_size`, so the same PDF and
+pool always produce a byte-identical plan (idempotent, cache-friendly, resumable).
+Assignments are appended to a JSONL provenance log (audit trail; re-runs append nothing).
+Pool entries are opaque names — no vendor SDK is imported, no client constructed.
+
+```bash
+# pool is required (flag or JCONTRACT_DISPATCH_POOL env) — order matters.
+uv run jcontract dispatch-plan doc.pdf --pool claude,openai \
+  --out plan.jsonl --provenance provenance.jsonl
+```
+
 ### Run the app
 
 ```bash

@@ -1165,6 +1165,144 @@ def redact_preview(
     typer.echo(f"redact-preview: {summary} (store: {map_store})", err=True)
 
 
+@app.command("dispatch-plan")
+def dispatch_plan(
+    pdf_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    pool: Annotated[
+        str | None,
+        typer.Option(
+            envvar="JCONTRACT_DISPATCH_POOL",
+            help=(
+                "Comma-separated provider names, e.g. 'claude,openai'. No default on "
+                "purpose — the pool is YOUR routing config, not this tool's opinion."
+            ),
+        ),
+    ] = None,
+    max_pages: Annotated[
+        int | None,
+        typer.Option(help="Plan only the first N pages. None = all pages."),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            help="Write the per-page plan JSONL here. Without --out the JSONL lines go to stdout."
+        ),
+    ] = None,
+    provenance: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Append assignments to this provenance JSONL audit log (idempotent: "
+                "re-running the same plan against the same pool appends nothing)."
+            ),
+        ),
+    ] = None,
+    task_kind: Annotated[
+        str,
+        typer.Option(help="Task label recorded per assignment (plan + provenance)."),
+    ] = "page-ocr",
+) -> None:
+    """Dry-run page→provider dispatch plan — deterministic, zero network (ssMP).
+
+    Renders each page (same 150dpi/q85 geometry as the vision parsers, so
+    the sha256 content hash lands in the SAME namespace as the OCR cache
+    keys), assigns it a provider name via the deterministic hash lottery
+    (sha256 % pool size, DECISION-cq.40), and emits the per-page table.
+    Same PDF + same pool → byte-identical output, every run.
+
+    Mechanism only (DECISION-cq.4): pool entries are opaque NAMES — no
+    vendor module is imported, no client constructed, no network touched
+    (asserted by tests/test_dispatch.py). Not wired into ingest; routing
+    of flagged pages stays pending (FORESHADOW-cq.1/cq.2).
+
+    Deterministic plan goes to stdout/--out; run-status (provenance append
+    counts) goes to stderr so double-run diffs stay empty.
+    """
+    import hashlib
+
+    import pypdfium2 as pdfium
+
+    from jcontract.impls._pdfium_render import render_page_jpeg
+
+    # Same render geometry as the vision parsers (rapidocr_parser module
+    # import is light — the OCR engine itself loads lazily elsewhere).
+    from jcontract.impls.rapidocr_parser import DEFAULT_DPI, DEFAULT_JPEG_QUALITY
+    from jcontract.ingest.dispatch import ProvenanceLog, ProviderDispatcher
+
+    if pool is None:
+        raise typer.BadParameter(
+            "a provider pool is required: pass --pool a,b or set JCONTRACT_DISPATCH_POOL"
+        )
+    try:
+        dispatcher = ProviderDispatcher([name.strip() for name in pool.split(",")])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    # Sequential render loop owning the document lifecycle — the
+    # render_page_jpeg contract (DECISION-ab3.46), same as parser.parse.
+    plan: list[dict[str, object]] = []
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        n_pages = len(pdf) if max_pages is None else min(max_pages, len(pdf))
+        for page_idx in range(n_pages):
+            jpeg_bytes = render_page_jpeg(
+                pdf[page_idx], dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
+            )
+            content_hash = hashlib.sha256(jpeg_bytes).hexdigest()
+            plan.append(
+                {
+                    "page_num": page_idx + 1,
+                    "content_hash": content_hash,
+                    "provider": dispatcher.assign(content_hash),
+                    "task_kind": task_kind,
+                }
+            )
+    finally:
+        pdf.close()
+
+    jsonl_lines = [json.dumps(r, ensure_ascii=False) for r in plan]
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(jsonl_lines) + "\n", encoding="utf-8")
+    else:
+        for line in jsonl_lines:
+            typer.echo(line)
+
+    typer.echo(f"\n=== dispatch-plan (dry-run): {pdf_path.name} ({len(plan)} pages) ===")
+    typer.echo(f"  pool: {dispatcher.pool}  task_kind: {task_kind}")
+    typer.echo(f"  {'page':>5}  {'content_hash':<16}  provider")
+    for record in plan:
+        hash_prefix = str(record["content_hash"])[:12] + "…"
+        typer.echo(f"  {record['page_num']:>5}  {hash_prefix:<16}  {record['provider']}")
+    for name in dispatcher.pool:
+        n_assigned = sum(1 for r in plan if r["provider"] == name)
+        typer.echo(f"  {name}: {n_assigned}/{len(plan)} page(s)")
+    if out is not None:
+        # stderr: the path is run-status, not plan content — stdout must
+        # stay byte-identical across runs even when --out names differ.
+        typer.echo(f"dispatch-plan: plan JSONL written to {out}", err=True)
+
+    if provenance is not None:
+        log = ProvenanceLog(provenance)
+        appended = sum(
+            log.append(
+                content_hash=str(r["content_hash"]),
+                provider=str(r["provider"]),
+                task_kind=task_kind,
+                redaction_applied=None,  # reserved ssDI field — dry-run never redacts
+                notes=f"dispatch-plan dry-run; pool={','.join(dispatcher.pool)}",
+            )
+            for r in plan
+        )
+        # stderr on purpose: append count differs between first/second run,
+        # while stdout must stay byte-identical for the determinism check.
+        typer.echo(
+            f"dispatch-plan: provenance {appended} new / "
+            f"{len(plan) - appended} already logged (log: {provenance})",
+            err=True,
+        )
+
+
 def main() -> None:
     """Entry point for the `jcontract` console script."""
     # Configure structlog to emit human-friendly logs by default.
