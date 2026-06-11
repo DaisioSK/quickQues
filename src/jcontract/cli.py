@@ -261,6 +261,9 @@ def _build_parser(
       - deepseek-v4      : DeepSeek V4 Vision via OpenAI-compatible API
                            (per-token, needs DEEPSEEK_API_KEY; ~3-5x cheaper
                            per page than claude-vision on flash variant)
+      - rapidocr         : local CPU OCR (PP-OCRv5 via ONNX Runtime) — $0,
+                           no API key, fully offline; lower fidelity than
+                           the LLM vision vendors (E3, ssLC)
 
     E10: ``vision_model`` overrides the OCR model for the two Claude
     vision parsers (e.g. "sonnet" for higher fidelity than the default
@@ -288,9 +291,16 @@ def _build_parser(
         from jcontract.impls.deepseek_v4_parser import DeepSeekV4Parser
 
         return DeepSeekV4Parser(max_pages=max_pages, profile=profile)
+    if name == "rapidocr":
+        from jcontract.impls.rapidocr_parser import RapidOcrParser
+
+        # profile / vision_model intentionally not forwarded: RapidOCR takes
+        # no prompt — its output depends only on pixels + ONNX weights, so a
+        # profile cannot change it and must not fork its cache namespace.
+        return RapidOcrParser(max_pages=max_pages)
     raise typer.BadParameter(
         f"Unknown parser '{name}'. "
-        f"Choose from: pypdf, claude-vision, claude-cli-vision, deepseek-v4."
+        f"Choose from: pypdf, claude-vision, claude-cli-vision, deepseek-v4, rapidocr."
     )
 
 
@@ -313,7 +323,8 @@ def ingest(
         typer.Option(
             help=(
                 "PDF parser: pypdf | claude-vision (API key) | "
-                "claude-cli-vision (subscription) | deepseek-v4 (API key, cheapest)"
+                "claude-cli-vision (subscription) | deepseek-v4 (API key, cheapest) | "
+                "rapidocr (local CPU, offline, free)"
             ),
         ),
     ] = "pypdf",
@@ -332,7 +343,7 @@ def ingest(
                 "OCR model for claude-vision / claude-cli-vision parsers "
                 "(e.g. 'sonnet' for higher text fidelity than the default 'haiku'). "
                 "A non-default model re-OCRs into its own cache namespace. "
-                "Ignored for pypdf / deepseek-v4."
+                "Ignored for pypdf / deepseek-v4 / rapidocr."
             ),
         ),
     ] = None,

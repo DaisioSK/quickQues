@@ -102,6 +102,16 @@ CLI subscription (zero API key) via `JCONTRACT_ANSWERER_BACKEND`.
 | `deepseek` | DeepSeek V4 Vision, per-token | `DEEPSEEK_API_KEY` (required) |
 | `ollama` | local VLM via Ollama — zero cost, page images never leave the machine | `JCONTRACT_OLLAMA_BASE_URL` (`http://localhost:11434`), `JCONTRACT_OLLAMA_VL_MODEL` (`qwen3-vl:8b`) |
 
+### Parser backends (`ingest --parser`)
+
+| Backend (`--parser`) | Runs on | Env vars (default) |
+|---|---|---|
+| `pypdf` (default) | pure-Python text extraction — free, but blind on scanned/image PDFs | none |
+| `claude-vision` | Anthropic API Vision, per-token | `ANTHROPIC_API_KEY` (required) |
+| `claude-cli-vision` | `claude` CLI, Claude Code subscription quota | none (needs `claude login`) |
+| `deepseek-v4` | DeepSeek V4 Vision, per-token (cheapest API option) | `DEEPSEEK_API_KEY` (required) |
+| `rapidocr` | local CPU OCR (PP-OCRv5 via ONNX Runtime) — zero cost, fully offline after a one-time ~20MB model download; lower fidelity than LLM vision | none |
+
 ### Run the app
 
 ```bash
