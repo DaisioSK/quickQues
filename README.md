@@ -33,7 +33,7 @@ change**. The bundled example domain is a construction contract corpus.
   plus drawing "captioners" that make diagrams retrievable. Content-addressed,
   model-aware OCR/caption cache → idempotent, cost-bounded re-ingest.
 - **Dependency-inverted, layered architecture** — Interfaces → Ingest → Retrieve+Answer
-  → API → Web UI. **12 core capabilities each defined as a Python Protocol/ABC** with
+  → API → Web UI. **13 core capabilities each defined as a Python Protocol/ABC** with
   vendor implementations injected; business logic imports interfaces only, never vendor
   SDKs. Pluggable LLM backends (Claude API / Claude CLI / Codex CLI).
 - **RAG evaluation harness** — retrieval recall@k with per-category rollup (incl.
@@ -65,9 +65,10 @@ change**. The bundled example domain is a construction contract corpus.
         ↑ concrete impls injected from impls/<vendor>/
 ```
 
-The 12 injectable interfaces: `PDFParser`, `OCREngine`, `VisionCaptioner`, `Chunker`,
+The 13 injectable interfaces: `PDFParser`, `OCREngine`, `VisionCaptioner`, `Chunker`,
 `Embedder`, `VectorStore`, `KeywordIndex`, `Reranker`, `Answerer`, `RefGraph`, `Judge`,
-`DomainProfile`. Swapping a vendor = swapping an impl; adding a domain = adding a profile.
+`DomainProfile`, `Redactor`. Swapping a vendor = swapping an impl; adding a domain =
+adding a profile.
 
 ---
 
@@ -112,6 +113,24 @@ CLI subscription (zero API key) via `JCONTRACT_ANSWERER_BACKEND`.
 | `claude-cli-vision` | `claude` CLI, Claude Code subscription quota | none (needs `claude login`) |
 | `deepseek-v4` | DeepSeek V4 Vision, per-token (cheapest API option) | `DEEPSEEK_API_KEY` (required) |
 | `rapidocr` | local CPU OCR (PP-OCRv5 via ONNX Runtime) — zero cost, fully offline after a one-time ~20MB model download; lower fidelity than LLM vision | none |
+
+### Redaction preview (`redact-preview`)
+
+Reversible pseudonymization for confidential corpora — a standalone mechanism component
+(not wired into ingest): a caller-supplied dictionary (entity literals) + regex whitelist
+replace sensitive mentions with corpus-stable `<TYPE_N>` placeholders; a persistent
+mapping store guarantees the same entity gets the same placeholder across files and
+sessions, and `--restore` reverses byte-exactly. Zero new dependencies, no NER.
+
+```bash
+# dictionary + mapping store live in YOUR data directory, never in this repo;
+# the mapping store is the restore key — gitignore it.
+export JCONTRACT_REDACTION_DICT=path/to/dictionary.yaml
+export JCONTRACT_REDACTION_MAP=path/to/maps/corpus.map.jsonl
+uv run jcontract redact-preview page.txt --out page.redacted.txt
+uv run jcontract redact-preview page.redacted.txt --restore --out page.roundtrip.txt
+diff page.txt page.roundtrip.txt   # empty = byte-exact
+```
 
 ### Run the app
 

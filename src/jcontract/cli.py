@@ -1088,6 +1088,83 @@ def ocr_quality(
         typer.echo(f"  JSONL report: {out}")
 
 
+@app.command("redact-preview")
+def redact_preview(
+    text_file: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    restore: Annotated[
+        bool,
+        typer.Option(
+            "--restore",
+            help="Reverse direction: replace known <TYPE_N> placeholders with the originals.",
+        ),
+    ] = False,
+    dictionary: Annotated[
+        Path | None,
+        typer.Option(
+            envvar="JCONTRACT_REDACTION_DICT",
+            help=(
+                "Redaction dictionary YAML (entities + regex patterns). Lives in your "
+                "project data dir, NOT in this repo."
+            ),
+        ),
+    ] = None,
+    map_store: Annotated[
+        Path | None,
+        typer.Option(
+            envvar="JCONTRACT_REDACTION_MAP",
+            help=(
+                "Persistent entity->placeholder mapping store (JSONL, created on first "
+                "use). This file is the RESTORE KEY — keep it out of git and logs."
+            ),
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Write the result here instead of stdout."),
+    ] = None,
+) -> None:
+    """Reversible-pseudonymization demo over one text file (ssDI).
+
+    Mechanism only — NOT wired into ingest/answer (DECISION-cq.4): this is a
+    local, offline preview of the Redactor component. Placeholders are
+    corpus-stable: the same entity gets the same <TYPE_N> across files and
+    sessions because numbering persists in the mapping store.
+
+    The result text goes to stdout verbatim (no trailing newline added), so
+    `redact-preview f | redact-preview /dev/stdin --restore | diff - f`
+    style byte-exact checks work; the one-line summary goes to stderr.
+    Summary and errors never include entity names (21-security).
+    """
+    from jcontract.impls.dict_regex_redactor import DictRegexRedactor
+
+    if dictionary is None or map_store is None:
+        raise typer.BadParameter(
+            "a dictionary and a mapping store are required: pass --dictionary/--map-store "
+            "or set JCONTRACT_REDACTION_DICT / JCONTRACT_REDACTION_MAP"
+        )
+    if not dictionary.exists():
+        raise typer.BadParameter(f"dictionary not found: {dictionary}")
+
+    redactor = DictRegexRedactor(dictionary_path=dictionary, store_path=map_store)
+    text = text_file.read_text(encoding="utf-8")
+    if restore:
+        result_text = redactor.restore(text)
+        summary = f"restored placeholders in {len(text)} chars"
+    else:
+        result = redactor.redact(text)
+        result_text = result.redacted_text
+        summary = (
+            f"replaced {result.spans_replaced} span(s), "
+            f"{result.mapping_delta} new mapping entrie(s) persisted"
+        )
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result_text, encoding="utf-8")
+    else:
+        typer.echo(result_text, nl=False)
+    typer.echo(f"redact-preview: {summary} (store: {map_store})", err=True)
+
+
 def main() -> None:
     """Entry point for the `jcontract` console script."""
     # Configure structlog to emit human-friendly logs by default.

@@ -22,6 +22,7 @@ from .judge import Judge, JudgeScore
 from .keyword import KeywordIndex
 from .ocr import OCRBlock, OCREngine
 from .parser import PDFParser
+from .redactor import RedactionResult, Redactor
 from .ref_graph import RefGraph
 from .reranker import Reranker
 from .schema import (
@@ -61,6 +62,8 @@ __all__ = [
     "KeywordIndex",
     "OCREngine",
     "PDFParser",
+    "RedactionResult",
+    "Redactor",
     "RefGraph",
     "Reranker",
     "VectorStore",
