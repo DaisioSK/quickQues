@@ -40,6 +40,19 @@ dependencies = [
     # dep check documented at the top of src/jcontract/impls/bge_reranker.py.
     "sentence-transformers==5.5.1",
     "openai>=1.55,<2",
+    # Offline OCR (E3, sub-sprint ssLC). `rapidocr` is the actively maintained
+    # successor of the legacy `rapidocr-onnxruntime` package (frozen at 1.4.4,
+    # last upload 2025-01); 3.x runs PP-OCRv5 ONNX models on CPU with zero
+    # network calls after the one-time model download. Apache-2.0, ~15MB wheel.
+    # [DECISION-ls.30 dev-sprint v4 §13]
+    "rapidocr==3.8.2",
+    # rapidocr 2.x+ moved its inference engines out of requires_dist — it
+    # imports whichever engine package is installed at runtime. CPU
+    # onnxruntime already arrives transitively via fastembed, but rapidocr's
+    # hard runtime requirement must not hinge on another vendor's transitive
+    # dep, so we declare it explicitly. CPU wheel only — onnxruntime-gpu
+    # rejected for sm_120 (FORESHADOW-ls.2 investigation).
+    "onnxruntime>=1.17,<2",
     "fastapi>=0.110,<1",
     "uvicorn[standard]>=0.30,<1",
     "pyyaml>=6.0.3",
@@ -118,6 +131,12 @@ ignore_missing_imports = true
 # We use a thin surface (PdfDocument, page.render). Allow untyped imports.
 [[tool.mypy.overrides]]
 module = "pypdfium2"
+ignore_missing_imports = true
+
+# rapidocr ships no py.typed marker as of 3.8. We use a thin surface
+# (RapidOCR(), OCRVersion enum, result .boxes/.txts). Allow untyped imports.
+[[tool.mypy.overrides]]
+module = ["rapidocr", "rapidocr.*"]
 ignore_missing_imports = true
 
 # ----- pytest -----
