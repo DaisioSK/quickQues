@@ -93,6 +93,15 @@ CLI subscription (zero API key) via `JCONTRACT_ANSWERER_BACKEND`.
 | `codex-cli` | `codex` CLI, ChatGPT subscription quota | none (needs `codex login`) |
 | `local` | any OpenAI-compatible endpoint — Ollama / vLLM / LM Studio; zero cost and zero data egress when local | `JCONTRACT_LOCAL_LLM_BASE_URL` (`http://localhost:11434/v1`), `JCONTRACT_LOCAL_LLM_MODEL` (`qwen3:14b`), `JCONTRACT_LOCAL_LLM_API_KEY` (`ollama` — placeholder, Ollama ignores it) |
 
+### Caption backends (`ingest --caption`)
+
+| Backend (`--caption-backend`) | Runs on | Env vars (default) |
+|---|---|---|
+| `claude-cli` (default) | `claude` CLI, Claude Code subscription quota | none (needs `claude login`) |
+| `claude-api` | Anthropic API Vision, per-token | `ANTHROPIC_API_KEY` (required) |
+| `deepseek` | DeepSeek V4 Vision, per-token | `DEEPSEEK_API_KEY` (required) |
+| `ollama` | local VLM via Ollama — zero cost, page images never leave the machine | `JCONTRACT_OLLAMA_BASE_URL` (`http://localhost:11434`), `JCONTRACT_OLLAMA_VL_MODEL` (`qwen3-vl:8b`) |
+
 ### Run the app
 
 ```bash

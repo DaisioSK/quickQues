@@ -233,8 +233,13 @@ def _build_captioner(backend: str, profile: DomainProfile | None = None) -> Visi
         from jcontract.impls.deepseek_vision_captioner import DeepSeekVisionCaptioner
 
         return DeepSeekVisionCaptioner(profile=profile)
+    if backend == "ollama":
+        from jcontract.impls.ollama_vision_captioner import OllamaVisionCaptioner
+
+        return OllamaVisionCaptioner(profile=profile)
     raise typer.BadParameter(
-        f"Unknown caption backend '{backend}'. Choose from: claude-cli, claude-api, deepseek."
+        f"Unknown caption backend '{backend}'. "
+        f"Choose from: claude-cli, claude-api, deepseek, ollama."
     )
 
 
@@ -346,7 +351,8 @@ def ingest(
         typer.Option(
             help=(
                 "Caption backend: claude-cli (subscription, no key — default) | "
-                "claude-api (ANTHROPIC_API_KEY) | deepseek (DEEPSEEK_API_KEY)."
+                "claude-api (ANTHROPIC_API_KEY) | deepseek (DEEPSEEK_API_KEY) | "
+                "ollama (local VLM, no key)."
             ),
         ),
     ] = "claude-cli",

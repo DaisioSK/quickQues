@@ -102,3 +102,20 @@ def get_local_llm_api_key() -> str:
     key only when targeting a remote compat endpoint that authenticates.
     """
     return _optional_env("JCONTRACT_LOCAL_LLM_API_KEY", "ollama")
+
+
+# ----- Local Ollama VLM (drawing captions) -----
+# Used by impls/ollama_vision_captioner.py (`--caption-backend ollama`).
+# Separate from the LOCAL_LLM_* trio above on purpose: the text answerer
+# and the vision captioner are independent model choices (you may caption
+# with qwen3-vl while answering with qwen3:14b — or run only one of them).
+
+
+def get_ollama_base_url() -> str:
+    """Ollama SERVER address (no /v1 — the impl appends the compat suffix)."""
+    return _optional_env("JCONTRACT_OLLAMA_BASE_URL", "http://localhost:11434")
+
+
+def get_ollama_vl_model() -> str:
+    """Vision-language model tag served by Ollama for drawing captions."""
+    return _optional_env("JCONTRACT_OLLAMA_VL_MODEL", "qwen3-vl:8b")
