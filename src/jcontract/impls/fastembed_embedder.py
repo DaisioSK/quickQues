@@ -132,6 +132,32 @@ def _resolve_cache_dir() -> str:
     return os.environ.get("FASTEMBED_CACHE_PATH") or str(Path.home() / ".cache" / "fastembed")
 
 
+def _resolve_batch_size() -> int:
+    """Embedding batch size: ``$JCONTRACT_EMBED_BATCH`` or fastembed's default 256.
+
+    # What: expose fastembed's ``embed(batch_size=...)`` as an env knob.
+    # Why:  onnxruntime activation memory scales with batch_size x the longest
+    #       sequence in the batch. With long-sequence models (bge-m3, 8192
+    #       tokens) and full-page chunks, batch 256 peaks ~15GB RSS and gets
+    #       OOM-killed on 16GB hosts (observed twice on a 1049-page volume,
+    #       2026-06-11, DECISION-cq.7). A smaller batch trades throughput for
+    #       a bounded arena. Default 256 == fastembed's own default, so
+    #       behavior is unchanged unless the env is set.
+    # Context: stopgap for FORESHADOW-ls.5; the structural fix (staged
+    #       subprocesses / streaming upsert) is charted under E13.
+    """
+    raw = os.environ.get("JCONTRACT_EMBED_BATCH", "")
+    if not raw:
+        return 256
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"JCONTRACT_EMBED_BATCH must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"JCONTRACT_EMBED_BATCH must be >= 1, got {value}")
+    return value
+
+
 class FastEmbedEmbedder:
     """ONNX multilingual embedder. Implements the ``Embedder`` Protocol.
 
@@ -182,4 +208,6 @@ class FastEmbedEmbedder:
         # fastembed's ``embed`` returns a generator of numpy arrays.
         # We materialize as Python lists to satisfy the Protocol contract
         # (list[list[float]]) and to keep the impl deps-free downstream.
-        return [vec.tolist() for vec in model.embed(texts)]
+        # batch_size is env-tunable to bound onnxruntime arena memory on
+        # low-RAM hosts (see _resolve_batch_size Why).
+        return [vec.tolist() for vec in model.embed(texts, batch_size=_resolve_batch_size())]

@@ -22,7 +22,8 @@ change**. The bundled example domain is a construction contract corpus.
 - **Hybrid retrieval** — dense embeddings (`bge-m3` via fastembed) + sparse keyword
   search (BM25 / jieba), fused with **Reciprocal Rank Fusion (RRF)** and re-ranked by a
   **`bge-reranker-v2-m3` cross-encoder**. Cross-lingual: a Chinese question retrieves
-  over English/Chinese source text. Vector store: **Qdrant**.
+  over English/Chinese source text. Vector store: **Qdrant**. Embedding batch size is
+  env-tunable (`JCONTRACT_EMBED_BATCH`, default 256) to bound memory on low-RAM hosts.
 - **Forced citation grounding** — every factual sentence must emit an exact
   `[file p.page]` citation; a post-processor drops uncited sentences; low-confidence
   answers **degrade gracefully to retrieval-only mode** instead of hallucinating.

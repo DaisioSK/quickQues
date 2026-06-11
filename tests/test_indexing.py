@@ -128,6 +128,38 @@ def test_fastembed_cache_dir_env_override(monkeypatch: pytest.MonkeyPatch) -> No
     assert _resolve_cache_dir() == "/custom/model-cache"
 
 
+def test_fastembed_batch_size_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset env resolves to 256 — fastembed's own default, zero behavior change."""
+    from jcontract.impls.fastembed_embedder import _resolve_batch_size
+
+    monkeypatch.delenv("JCONTRACT_EMBED_BATCH", raising=False)
+    assert _resolve_batch_size() == 256
+
+
+def test_fastembed_batch_size_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JCONTRACT_EMBED_BATCH bounds onnxruntime arena memory on low-RAM hosts.
+
+    # Why: batch 256 x bge-m3 long sequences peaked ~15GB RSS and was
+    # OOM-killed twice on a 16GB host (2026-06-11, DECISION-cq.7).
+    """
+    from jcontract.impls.fastembed_embedder import _resolve_batch_size
+
+    monkeypatch.setenv("JCONTRACT_EMBED_BATCH", "16")
+    assert _resolve_batch_size() == 16
+
+
+def test_fastembed_batch_size_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-integer / non-positive values fail fast instead of silently embedding."""
+    from jcontract.impls.fastembed_embedder import _resolve_batch_size
+
+    monkeypatch.setenv("JCONTRACT_EMBED_BATCH", "lots")
+    with pytest.raises(ValueError, match="JCONTRACT_EMBED_BATCH"):
+        _resolve_batch_size()
+    monkeypatch.setenv("JCONTRACT_EMBED_BATCH", "0")
+    with pytest.raises(ValueError, match="JCONTRACT_EMBED_BATCH"):
+        _resolve_batch_size()
+
+
 def test_fastembed_deterministic(embedder: FastEmbedEmbedder) -> None:
     """Same input → byte-identical vector across two calls.
 
