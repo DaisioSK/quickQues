@@ -884,6 +884,210 @@ def show_chunks(
         typer.echo("(empty — run `jcontract ingest <pdf>` first)")
 
 
+# ssQA: signals the `ocr-quality` report exposes for --flag-below/--flag-above.
+# The first five are the PRE-REGISTERED candidate list (dev-sprint v5
+# §预注册评测协议 3, frozen — do not add/remove); garbled_ratio is the
+# additional garbled-text heuristic the same protocol carries alongside them.
+_QUALITY_SIGNALS = (
+    "mean_score",
+    "min_score",
+    "low_score_ratio",
+    "boxes",
+    "non_alnum_ratio",
+    "garbled_ratio",
+)
+
+
+def _parse_flag_rules(specs: list[str], option_name: str) -> list[tuple[str, float]]:
+    """Parse repeated ``<signal>:<value>`` flag specs into (signal, threshold).
+
+    Unknown signal names and non-numeric thresholds fail fast as usage
+    errors — a typo'd signal silently flagging nothing would corrupt the
+    L5 calibration downstream.
+    """
+    rules: list[tuple[str, float]] = []
+    for spec in specs:
+        signal, sep, raw_value = spec.partition(":")
+        if not sep or signal not in _QUALITY_SIGNALS:
+            raise typer.BadParameter(
+                f"{option_name} expects <signal>:<value> with signal one of "
+                f"{', '.join(_QUALITY_SIGNALS)}; got {spec!r}"
+            )
+        try:
+            rules.append((signal, float(raw_value)))
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"{option_name} threshold must be numeric; got {spec!r}"
+            ) from exc
+    return rules
+
+
+def _quality_report_record(metrics: dict[str, object]) -> dict[str, object]:
+    """Project a metrics sidecar dict onto the per-page JSONL report record.
+
+    Emits the five pre-registered signals + garbled_ratio. ``non_alnum_ratio``
+    (the registered "非字母数字占比" signal) derives from the sidecar's stored
+    ``alnum_ratio`` as 1 - alnum_ratio; the raw per-box score list stays in
+    the sidecar (lossless record) and out of the report (readable record).
+    """
+
+    def _round4(value: object) -> float | None:
+        return round(value, 4) if isinstance(value, int | float) else None
+
+    alnum_ratio = metrics.get("alnum_ratio")
+    record: dict[str, object] = {
+        "page_num": metrics["page_num"],
+        "boxes": metrics["boxes"],
+        "mean_score": _round4(metrics.get("mean_score")),
+        "min_score": _round4(metrics.get("min_score")),
+        "low_score_ratio": _round4(metrics.get("low_score_ratio")),
+        "non_alnum_ratio": (
+            round(1.0 - alnum_ratio, 4) if isinstance(alnum_ratio, int | float) else None
+        ),
+        "garbled_ratio": _round4(metrics.get("garbled_ratio")),
+    }
+    if "engine_error" in metrics:
+        record["engine_error"] = metrics["engine_error"]
+    return record
+
+
+def _flag_reasons(
+    record: dict[str, object],
+    below_rules: list[tuple[str, float]],
+    above_rules: list[tuple[str, float]],
+) -> list[str]:
+    """Evaluate caller-supplied threshold rules against one report record.
+
+    A null signal (undefined — e.g. mean_score on a zero-box page) never
+    triggers a rule: there is no evidence to compare. Zero-box pages remain
+    catchable via the always-defined ``boxes`` signal. [DECISION-cq.20]
+    """
+    reasons: list[str] = []
+    for signal, threshold in below_rules:
+        value = record.get(signal)
+        if isinstance(value, int | float) and value < threshold:
+            reasons.append(f"{signal}={value:g}<{threshold:g}")
+    for signal, threshold in above_rules:
+        value = record.get(signal)
+        if isinstance(value, int | float) and value > threshold:
+            reasons.append(f"{signal}={value:g}>{threshold:g}")
+    return reasons
+
+
+@app.command("ocr-quality")
+def ocr_quality(
+    pdf_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    max_pages: Annotated[
+        int | None,
+        typer.Option(help="Scan only the first N pages. None = all pages."),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Write the per-page JSONL report here. Without --out the JSONL lines go to stdout."
+            ),
+        ),
+    ] = None,
+    flag_below: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--flag-below",
+            help=(
+                "Flag pages where <signal> is BELOW <value>, e.g. "
+                "--flag-below mean_score:0.85 (repeatable; rules OR together). "
+                f"Signals: {', '.join(_QUALITY_SIGNALS)}."
+            ),
+        ),
+    ] = None,
+    flag_above: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--flag-above",
+            help=(
+                "Flag pages where <signal> is ABOVE <value>, e.g. "
+                "--flag-above garbled_ratio:0.2 — for the higher-is-worse "
+                "signals that --flag-below cannot express (repeatable)."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Per-page OCR quality report for the rapidocr lane (ssQA).
+
+    Emits one JSONL record per page with the five pre-registered quality
+    signals (mean_score, min_score, low_score_ratio, boxes, non_alnum_ratio)
+    plus the garbled-text heuristic (garbled_ratio), and a terminal summary.
+
+    Locate + mark ONLY: this command ships NO built-in thresholds — pass
+    them via --flag-below/--flag-above once the L5 calibration has derived
+    them (mechanism/policy separation, DECISION-cq.20) — and performs no
+    routing/re-OCR of flagged pages (FORESHADOW-cq.1 pending).
+
+    Reads the metrics sidecar when present; otherwise force-runs the local
+    OCR engine (~1s/page CPU, even on .txt cache hits) and backfills the
+    sidecar so the next scan is free. Fully offline, zero quota.
+    """
+    # Lazy import — keeps opencv/onnxruntime out of cold-start for other
+    # commands (same stance as _build_parser).
+    from jcontract.impls.rapidocr_parser import RapidOcrParser
+
+    below_rules = _parse_flag_rules(flag_below or [], "--flag-below")
+    above_rules = _parse_flag_rules(flag_above or [], "--flag-above")
+
+    parser = RapidOcrParser(max_pages=max_pages)
+    pages = parser.quality_metrics(pdf_path)
+
+    records: list[dict[str, object]] = []
+    for metrics in pages:
+        record = _quality_report_record(metrics)
+        reasons = _flag_reasons(record, below_rules, above_rules)
+        record["flagged"] = bool(reasons)
+        record["flag_reasons"] = reasons
+        records.append(record)
+
+    jsonl_lines = [json.dumps(r, ensure_ascii=False) for r in records]
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(jsonl_lines) + "\n", encoding="utf-8")
+    else:
+        for line in jsonl_lines:
+            typer.echo(line)
+
+    # Terminal summary table: per-signal aggregates over the pages where the
+    # signal is defined (nulls excluded), then the flagged-page roll-up.
+    typer.echo(f"\n=== ocr-quality: {pdf_path.name} ({len(records)} pages) ===")
+    typer.echo(f"  {'signal':<16} {'mean':>8} {'min':>8} {'max':>8} {'n_def':>6}")
+    for signal in _QUALITY_SIGNALS:
+        values = [v for r in records if isinstance(v := r.get(signal), int | float)]
+        if values:
+            mean_v = sum(values) / len(values)
+            typer.echo(
+                f"  {signal:<16} {mean_v:>8.4f} {min(values):>8.4f} "
+                f"{max(values):>8.4f} {len(values):>6}"
+            )
+        else:
+            typer.echo(f"  {signal:<16} {'n/a':>8} {'n/a':>8} {'n/a':>8} {0:>6}")
+
+    errored = [r["page_num"] for r in records if "engine_error" in r]
+    if errored:
+        typer.echo(f"  engine errors: {len(errored)} page(s) -> {errored}")
+
+    if below_rules or above_rules:
+        rule_text = ", ".join(
+            [f"{s}<{t:g}" for s, t in below_rules] + [f"{s}>{t:g}" for s, t in above_rules]
+        )
+        flagged_pages = [r["page_num"] for r in records if r["flagged"]]
+        typer.echo(f"  flag rules: {rule_text}")
+        typer.echo(f"  flagged: {len(flagged_pages)}/{len(records)} page(s) -> {flagged_pages}")
+    else:
+        typer.echo(
+            "  flag rules: none supplied — no pages flagged (pass --flag-below/--flag-above)"
+        )
+
+    if out is not None:
+        typer.echo(f"  JSONL report: {out}")
+
+
 def main() -> None:
     """Entry point for the `jcontract` console script."""
     # Configure structlog to emit human-friendly logs by default.

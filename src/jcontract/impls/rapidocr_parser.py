@@ -48,6 +48,7 @@ OCR-fidelity comparison (docs/localstack-ocr-compare.md, project repo).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 from collections.abc import Callable, Sequence
@@ -77,6 +78,73 @@ DEFAULT_JPEG_QUALITY = 85
 # the constructor; a non-default choice gets its own cache namespace.
 DEFAULT_MODEL_TYPE = "mobile"
 _MODEL_SLUG_TEMPLATE = "ppocrv5-{model_type}"
+
+# ssQA: per-box recognition scores below this count as "low confidence" in
+# the metrics sidecar (`low_score_ratio`). 0.7 is part of the FROZEN
+# pre-registered signal list (dev-sprint v5 §预注册评测协议 3) — changing it
+# would invalidate the L5 calibration, so it is a module constant, not a knob.
+LOW_SCORE_THRESHOLD = 0.7
+
+# ssQA garbled-text heuristic: characters we EXPECT on these scans —
+# printable ASCII, CJK ideographs (incl. Ext-A), CJK/fullwidth punctuation,
+# common general punctuation (–—‘’“”…·), and whitespace. Anything else
+# (e.g. ª, ¤, stray Greek/Cyrillic, box-drawing junk) is what low-quality
+# OCR of noisy scans typically emits → counts toward `garbled_ratio`.
+_EXPECTED_CHAR_RANGES: tuple[tuple[int, int], ...] = (
+    (0x20, 0x7E),  # printable ASCII
+    (0x2010, 0x2027),  # general punctuation: dashes, quotes, ellipsis
+    (0x3000, 0x303F),  # CJK symbols & punctuation
+    (0x3400, 0x4DBF),  # CJK Ext-A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xFF00, 0xFFEF),  # fullwidth forms
+)
+
+
+def _is_expected_char(ch: str) -> bool:
+    code = ord(ch)
+    return any(lo <= code <= hi for lo, hi in _EXPECTED_CHAR_RANGES)
+
+
+def _page_metrics(page_num: int, scores: Sequence[float], text: str) -> dict[str, Any]:
+    """Compute the per-page OCR quality metrics record (sidecar schema, ssQA).
+
+    Schema (frozen with the pre-registered signal list, DECISION-cq.21):
+      page_num         page the bytes were first seen on (informational —
+                       the sidecar itself is content-addressed)
+      boxes            number of recognised text boxes
+      scores           raw per-box recognition scores (full list — the
+                       sidecar is the lossless record; reports aggregate)
+      mean_score       mean of scores            (null when boxes == 0)
+      min_score        min of scores             (null when boxes == 0)
+      low_score_ratio  share of boxes < 0.7      (null when boxes == 0)
+      alnum_ratio      alphanumeric share of non-whitespace chars
+                       (str.isalnum — covers CJK)   (null when no chars)
+      garbled_ratio    share of non-whitespace chars outside the expected
+                       charset (see _EXPECTED_CHAR_RANGES) (null when no chars)
+
+    Why null (not 0.0) for undefined: a zero-box page has NO score evidence —
+    forcing 0.0 would make it look maximally bad on mean_score and perfectly
+    good on low_score_ratio at the same time. Callers treat null as "signal
+    unavailable"; empty pages are still catchable via the `boxes` signal.
+    """
+    score_list = [float(s) for s in scores]
+    n = len(score_list)
+    chars = [ch for ch in text if not ch.isspace()]
+    n_chars = len(chars)
+    return {
+        "page_num": page_num,
+        "boxes": n,
+        "scores": score_list,
+        "mean_score": (sum(score_list) / n) if n else None,
+        "min_score": min(score_list) if n else None,
+        "low_score_ratio": (sum(1 for s in score_list if s < LOW_SCORE_THRESHOLD) / n)
+        if n
+        else None,
+        "alnum_ratio": (sum(1 for ch in chars if ch.isalnum()) / n_chars) if n_chars else None,
+        "garbled_ratio": (sum(1 for ch in chars if not _is_expected_char(ch)) / n_chars)
+        if n_chars
+        else None,
+    }
 
 
 def _assemble_reading_order(boxes: Sequence[Sequence[Sequence[float]]], txts: Sequence[str]) -> str:
@@ -268,6 +336,25 @@ class RapidOcrParser:
         """
         return _classify_page(jpeg_bytes)
 
+    def _text_cache_path(self, cache_key: str) -> Path:
+        """OCR text cache file for these JPEG bytes.
+
+        Vendor prefix + "text" kind (this vendor never produces drawing
+        captions) + model suffix. Profile deliberately absent — see module
+        docstring.
+        """
+        return self._cache_dir / f"{self.cache_prefix}-{cache_key}.text{self._model_suffix}.txt"
+
+    def _metrics_path(self, cache_key: str) -> Path:
+        """Quality-metrics sidecar for these JPEG bytes (ssQA).
+
+        Same namespace rules as the .txt: vendor prefix + content hash +
+        model suffix — `rapidocr-<sha256>.metrics[.<model>].json`. A
+        non-default model OCRs differently, so its scores live in their
+        own sidecar namespace exactly like its text does.
+        """
+        return self._cache_dir / f"{self.cache_prefix}-{cache_key}.metrics{self._model_suffix}.json"
+
     def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
         """Cache-check + local OCR for pre-rendered JPEG bytes.
 
@@ -275,14 +362,16 @@ class RapidOcrParser:
         serialized by the instance lock). Signature matches the other
         vendors so cli.py batch-ingest could dispatch uniformly if this
         vendor is ever wired there.
+
+        ssQA: whenever the engine actually runs (cache miss), the per-box
+        scores are persisted to the metrics sidecar alongside the .txt.
+        A cache HIT deliberately does NOT backfill a missing sidecar —
+        that would force an engine run inside ingest and regress its
+        performance; backfill belongs to the `ocr-quality` command
+        (quality_metrics below). [DECISION-cq.21]
         """
         cache_key = hashlib.sha256(jpeg_bytes).hexdigest()
-        # Vendor prefix + "text" kind (this vendor never produces drawing
-        # captions) + model suffix. Profile deliberately absent — see module
-        # docstring.
-        cache_path = (
-            self._cache_dir / f"{self.cache_prefix}-{cache_key}.text{self._model_suffix}.txt"
-        )
+        cache_path = self._text_cache_path(cache_key)
 
         if cache_path.exists():
             logger.info(
@@ -323,6 +412,11 @@ class RapidOcrParser:
             text = _assemble_reading_order(result.boxes, result.txts)
 
         cache_path.write_text(text, encoding="utf-8")
+        # ssQA: the engine ran, so the per-box scores exist exactly now —
+        # persist them or lose them (a later cache hit never re-runs the
+        # engine). json.dump of a few hundred floats is negligible next to
+        # the ~1s OCR pass, so ingest-path cost is unchanged in substance.
+        self._write_metrics_sidecar(cache_key, page_num, result, text)
         logger.info(
             "rapidocr_parser.ocr_complete",
             pdf=pdf_name,
@@ -331,3 +425,100 @@ class RapidOcrParser:
             chars=len(text),
         )
         return text
+
+    def _write_metrics_sidecar(
+        self, cache_key: str, page_num: int, result: Any, text: str
+    ) -> dict[str, Any]:
+        """Compute + persist the quality-metrics sidecar for one engine run."""
+        scores: Sequence[float] = () if result.scores is None else result.scores
+        metrics = _page_metrics(page_num, scores, text)
+        self._metrics_path(cache_key).write_text(
+            json.dumps(metrics, ensure_ascii=False), encoding="utf-8"
+        )
+        return metrics
+
+    # ------------------------------------------------------------------
+    # ssQA: per-page quality metrics (the `ocr-quality` CLI entry point)
+    # ------------------------------------------------------------------
+
+    def quality_metrics(self, pdf_path: Path) -> list[dict[str, Any]]:
+        """Per-page OCR quality metrics for ``pdf_path`` (up to ``max_pages``).
+
+        Sidecar-first: a page whose metrics sidecar already exists is read
+        from disk (no engine run). Otherwise the engine is FORCE-run — even
+        when the .txt cache exists, because the text cache holds no scores —
+        and the sidecar is backfilled so the next scan is free. The .txt is
+        also written when (and only when) it is missing: the engine output
+        is content-addressed, so this is a free, byte-equivalent backfill;
+        an existing .txt is never rewritten. [DECISION-cq.22]
+
+        This is the ONLY sidecar-backfill path — ingest never does it
+        (DECISION-cq.21, zero ingest-performance regression).
+        """
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        try:
+            total_pages = len(pdf)
+            page_count = min(total_pages, self._max_pages) if self._max_pages else total_pages
+            logger.info(
+                "rapidocr_parser.quality_scan_start",
+                pdf=pdf_path.name,
+                total_pages=total_pages,
+                will_process=page_count,
+                model_type=self._model_type,
+            )
+            records: list[dict[str, Any]] = []
+            for page_idx in range(page_count):
+                page_num = page_idx + 1  # 1-indexed per ParsedPage contract
+                jpeg_bytes = render_page_jpeg(
+                    pdf[page_idx], dpi=self._dpi, jpeg_quality=self._jpeg_quality
+                )
+                records.append(self._page_quality(jpeg_bytes, page_num, pdf_path.name))
+            return records
+        finally:
+            pdf.close()
+
+    def _page_quality(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> dict[str, Any]:
+        """Sidecar-read or engine-run quality metrics for one rendered page.
+
+        Engine failure mirrors the ingest stance — log, return a degenerate
+        record (all signals null + ``engine_error``), never abort the scan,
+        never cache — so a transient failure retries on the next scan.
+        """
+        cache_key = hashlib.sha256(jpeg_bytes).hexdigest()
+        metrics_path = self._metrics_path(cache_key)
+        if metrics_path.exists():
+            metrics: dict[str, Any] = json.loads(metrics_path.read_text(encoding="utf-8"))
+            # Report the page we are scanning NOW; the stored value is just
+            # where these bytes were first seen (content-addressed sidecar).
+            metrics["page_num"] = page_num
+            return metrics
+
+        try:
+            engine = self._ensure_engine()
+            with self._engine_call_lock:
+                result = engine(jpeg_bytes)
+        except Exception as exc:  # noqa: BLE001 — per-page errors must not abort the scan
+            logger.warning(
+                "rapidocr_parser.quality_ocr_error",
+                pdf=pdf_name,
+                page=page_num,
+                error_type=type(exc).__name__,
+            )
+            degenerate = _page_metrics(page_num, (), "")
+            degenerate.update({"boxes": None, "engine_error": type(exc).__name__})
+            return degenerate
+
+        if result.txts is None or result.boxes is None or len(result.txts) == 0:
+            text = ""
+        else:
+            text = _assemble_reading_order(result.boxes, result.txts)
+
+        text_path = self._text_cache_path(cache_key)
+        if not text_path.exists():
+            text_path.write_text(text, encoding="utf-8")
+        return self._write_metrics_sidecar(cache_key, page_num, result, text)
