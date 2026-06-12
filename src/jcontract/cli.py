@@ -1516,6 +1516,96 @@ def dispatch_plan(
         )
 
 
+@app.command("table-preview")
+def table_preview(
+    pdf_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    page: Annotated[
+        int,
+        typer.Option(min=1, help="1-indexed page to structure (one page per run)."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help=(
+                "'md' = markdown table (retrieval/embedding view); 'elements' = "
+                "JSONL cell list with normalized geometry + logical row/col "
+                "indices (citation/highlight view)."
+            ),
+        ),
+    ] = "md",
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Write the result here instead of stdout."),
+    ] = None,
+) -> None:
+    """Structure one page's table via rapid-table SLANet-plus (ssTB).
+
+    Mechanism only — never touches the chunker, the index, or any cache
+    (chunk_type="table" activation is a separate contract-level sprint,
+    FORESHADOW-tt.1). Renders the page at the standard 150dpi/q85 cache-key
+    geometry, OCRs it (PP-OCRv5, local CPU), feeds the OCR boxes straight
+    into the table-structure engine (no second OCR pass, DECISION-tt.30)
+    and prints the requested view.
+
+    Result goes to stdout/--out verbatim; the one-line summary goes to
+    stderr so piped output stays clean. A page with no detectable table
+    structure produces empty output + a stderr notice — not an error.
+    """
+    # Lazy imports — rapid-table/rapidocr drag in opencv + onnxruntime;
+    # none of that belongs in cold-start for the other commands (same
+    # stance as ocr-quality / ocr-gallery).
+    from jcontract.impls._pdfium_render import render_pdf_page_jpeg
+    from jcontract.impls._table_assemble import (
+        page_ocr_results,
+        render_elements,
+        render_markdown,
+        structure_table,
+    )
+    from jcontract.impls.rapidocr_parser import DEFAULT_DPI, DEFAULT_JPEG_QUALITY
+
+    if output_format not in ("md", "elements"):
+        raise typer.BadParameter("--format must be 'md' or 'elements'")
+
+    # Same 150dpi/q85 geometry as every vision parser — identical bytes to
+    # what ingest renders, via the thread-safe open/render/close entry
+    # point (DECISION-ab3.46). pdfium raises IndexError on an out-of-range
+    # page; surface it as a usage error instead of a traceback.
+    try:
+        jpeg_bytes = render_pdf_page_jpeg(
+            pdf_path, page, dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
+        )
+    except IndexError as exc:
+        raise typer.BadParameter(f"page {page} is out of range for {pdf_path.name}") from exc
+
+    # Fresh OCR pass (~1s on CPU): the .txt OCR cache stores assembled text
+    # only — table structuring needs the raw box geometry, which exists
+    # exactly while the OCR engine result is in hand. The boxes then pass
+    # straight through to the structure engine — no second OCR.
+    # [DECISION-tt.30]
+    ocr_results = page_ocr_results(jpeg_bytes)
+    cells = structure_table(jpeg_bytes, ocr_results)
+
+    rendered = render_markdown(cells) if output_format == "md" else render_elements(cells)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered + "\n", encoding="utf-8")
+    else:
+        typer.echo(rendered)
+
+    # Summary on stderr: stdout must stay exactly the rendered view so
+    # `table-preview ... > table.md` produces a clean artifact.
+    if cells:
+        n_rows = max(c.row_end for c in cells) + 1
+        n_cols = max(c.col_end for c in cells) + 1
+        summary = f"{len(cells)} cell(s), {n_rows} row(s) x {n_cols} col(s)"
+    else:
+        summary = "no table structure detected"
+    typer.echo(f"table-preview: {pdf_path.name} p.{page}: {summary}", err=True)
+    if out is not None:
+        typer.echo(f"table-preview: written to {out}", err=True)
+
+
 def main() -> None:
     """Entry point for the `jcontract` console script."""
     # Configure structlog to emit human-friendly logs by default.
