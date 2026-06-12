@@ -53,6 +53,16 @@ dependencies = [
     # dep, so we declare it explicitly. CPU wheel only — onnxruntime-gpu
     # rejected for sm_120 (FORESHADOW-ls.2 investigation).
     "onnxruntime>=1.17,<2",
+    # Table structure recognition (ssTB). SLANet-plus ONNX running on the
+    # CPU onnxruntime we already ship; the only engine of the four
+    # candidates with non-zero output on all 5 frozen sample table pages
+    # (mean gold cell recall 0.69). 43KB pure-python wheel + one-time
+    # ~7.5MB slanet-plus.onnx download; every transitive dep already
+    # arrives via rapidocr/fastembed. Apache-2.0, OSV clean. Rejected:
+    # img2table (cv2 namespace clash + 2/5 zero-output pages),
+    # PP-StructureV3 (194.8MB wheel), pdfplumber/camelot (scanned PDFs
+    # have no text layer). [DECISION-tt.20 dev-sprint v6 §13]
+    "rapid-table==3.0.2",
     "fastapi>=0.110,<1",
     "uvicorn[standard]>=0.30,<1",
     "pyyaml>=6.0.3",
@@ -137,6 +147,13 @@ ignore_missing_imports = true
 # (RapidOCR(), OCRVersion enum, result .boxes/.txts). Allow untyped imports.
 [[tool.mypy.overrides]]
 module = ["rapidocr", "rapidocr.*"]
+ignore_missing_imports = true
+
+# rapid-table ships no py.typed marker as of 3.0.2 (verified: no marker in
+# the installed wheel). Thin surface only: RapidTable(RapidTableInput(...)),
+# ModelType enum, result .pred_htmls/.cell_bboxes/.logic_points.
+[[tool.mypy.overrides]]
+module = ["rapid_table", "rapid_table.*"]
 ignore_missing_imports = true
 
 # ----- pytest -----
