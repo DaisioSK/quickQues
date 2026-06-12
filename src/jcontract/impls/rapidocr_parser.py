@@ -426,6 +426,25 @@ class RapidOcrParser:
         )
         return text
 
+    def ocr_text_for_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
+        """Public cache-first OCR for one pre-rendered JPEG (ssTG `ocr-gallery`).
+
+        What: thin public entry point over the existing ``_ocr_jpeg``
+        cache-check + OCR path, for callers that already hold the rendered
+        JPEG bytes (the gallery renders pages itself to export them as
+        ``pNNNN.jpg``, so re-rendering inside ``parse()`` would be waste).
+
+        Why a wrapper instead of exposing ``_ocr_jpeg`` directly: the
+        private path assumes ``parse()`` already created the cache dir;
+        this entry point owns that precondition so external callers cannot
+        hit a missing-directory write error on a cold cache. Behaviour is
+        otherwise identical — cache hit reads the .txt, miss runs the
+        engine, writes .txt + metrics sidecar (N=2 reuse per project §5.3:
+        the gallery shares this mechanism rather than copying it).
+        """
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
+
     def _write_metrics_sidecar(
         self, cache_key: str, page_num: int, result: Any, text: str
     ) -> dict[str, Any]:

@@ -1088,6 +1088,219 @@ def ocr_quality(
         typer.echo(f"  JSONL report: {out}")
 
 
+def _violation_margin(
+    record: dict[str, object],
+    below_rules: list[tuple[str, float]],
+    above_rules: list[tuple[str, float]],
+) -> float | None:
+    """How far past its threshold the worst-violated rule is (None = not flagged).
+
+    What: for each triggered rule the margin is ``threshold - value`` (below
+    rules) or ``value - threshold`` (above rules); the record's severity is
+    the max margin across its triggered rules. Same null-signal semantics as
+    ``_flag_reasons``: an undefined signal never contributes.
+
+    Why: the gallery index sorts worst-first. With the common single
+    --flag-below rule, descending margin is EXACTLY "ascending by the
+    triggered signal value" (margin = threshold - value); the margin
+    formulation extends that deterministically to multi-rule and
+    --flag-above cases, where "ascending signal" is ambiguous. Margins of
+    differently-scaled signals (boxes vs ratios) compare arbitrarily but
+    deterministically — acceptable for a human-triage ordering.
+
+    Context: [DECISION-tt.10 dev-sprint v6 §13].
+    """
+    margins: list[float] = []
+    for signal, threshold in below_rules:
+        value = record.get(signal)
+        if isinstance(value, int | float) and value < threshold:
+            margins.append(threshold - float(value))
+    for signal, threshold in above_rules:
+        value = record.get(signal)
+        if isinstance(value, int | float) and value > threshold:
+            margins.append(float(value) - threshold)
+    return max(margins) if margins else None
+
+
+def _gallery_text_preview(text: str, limit: int = 80) -> str:
+    """Single-line, table-safe preview of a page's OCR text for index.md.
+
+    Whitespace (incl. newlines) collapses to single spaces, the result is
+    truncated to ``limit`` chars FIRST, then ``|`` is escaped so a pipe in
+    the OCR text cannot break the markdown table row. The full untruncated
+    text lives in the page's .txt file — the preview is only for scanning
+    the index. [DECISION-tt.12 dev-sprint v6 §13]
+    """
+    collapsed = " ".join(text.split())
+    return collapsed[:limit].replace("|", "\\|")
+
+
+@app.command("ocr-gallery")
+def ocr_gallery(
+    pdf_path: Annotated[Path, typer.Argument(exists=True, readable=True)],
+    out: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Gallery output directory (created if missing): pNNNN.jpg + "
+                "pNNNN.txt per flagged page + index.md."
+            ),
+        ),
+    ],
+    quality: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            readable=True,
+            help=(
+                "Archived `ocr-quality` per-page JSONL report to reuse (skips the "
+                "quality re-scan). Without it the same scan `ocr-quality` performs "
+                "runs first (~1s/page on a cold metrics cache)."
+            ),
+        ),
+    ] = None,
+    flag_below: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--flag-below",
+            help=(
+                "Select pages where <signal> is BELOW <value>, e.g. "
+                "--flag-below min_score:0.756 (repeatable; rules OR together). "
+                f"Signals: {', '.join(_QUALITY_SIGNALS)}."
+            ),
+        ),
+    ] = None,
+    flag_above: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--flag-above",
+            help=(
+                "Select pages where <signal> is ABOVE <value> — for the "
+                "higher-is-worse signals (e.g. garbled_ratio) that "
+                "--flag-below cannot express (repeatable)."
+            ),
+        ),
+    ] = None,
+    top: Annotated[
+        int | None,
+        typer.Option(help="Export only the worst N flagged pages. None = all flagged."),
+    ] = None,
+) -> None:
+    """Export low-quality OCR pages as a human-triage gallery (ssTG).
+
+    For every flagged page: the rendered page image (`pNNNN.jpg`, same
+    150dpi/q85 geometry as the OCR cache key, so the OCR text is a cache
+    hit whenever the page was OCR'd before), the OCR plain text
+    (`pNNNN.txt`, full, untruncated), and one `index.md` row — worst page
+    first — so a maintainer can eyeball WHY pages score low before any
+    routing rule is written (manual triage first, DECISION-tt.3).
+
+    Thresholds are caller-supplied, exactly like `ocr-quality` (same
+    `<signal>:<value>` syntax, same signal list); any flagged/flag_reasons
+    fields stored in an archived --quality report are deliberately ignored
+    and the rules are re-evaluated from the per-page signals, so one
+    archived scan serves any threshold. [DECISION-tt.13]
+
+    Read-only triage: writes ONLY into --out; never touches the index or
+    re-routes pages (cloud redo is a later wiring sprint, FORESHADOW-tt.2).
+    """
+    # Lazy import — keeps the rapidocr module out of cold-start for other
+    # commands (same stance as ocr-quality / dispatch-plan).
+    from jcontract.impls._pdfium_render import render_pdf_page_jpeg
+    from jcontract.impls.rapidocr_parser import (
+        DEFAULT_DPI,
+        DEFAULT_JPEG_QUALITY,
+        RapidOcrParser,
+    )
+
+    # Shared rule parsing with ocr-quality (same helper, same error text) —
+    # N=2 reuse instead of a copy.
+    below_rules = _parse_flag_rules(flag_below or [], "--flag-below")
+    above_rules = _parse_flag_rules(flag_above or [], "--flag-above")
+    # What: at least one rule is mandatory here (unlike ocr-quality, where
+    #       a rule-less run still produces a useful report).
+    # Why:  with no rules nothing is flagged, so the gallery would silently
+    #       export zero pages — a confusing no-op; fail fast as usage error.
+    if not below_rules and not above_rules:
+        raise typer.BadParameter(
+            "ocr-gallery needs at least one selection rule: pass --flag-below/--flag-above"
+        )
+
+    parser = RapidOcrParser()
+
+    # Per-page quality records: archived JSONL when supplied, fresh scan
+    # otherwise (identical projection to what ocr-quality writes).
+    if quality is not None:
+        records = [
+            json.loads(line)
+            for line in quality.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    else:
+        records = [_quality_report_record(m) for m in parser.quality_metrics(pdf_path)]
+
+    # Re-evaluate the caller's rules against every record (stored flags are
+    # ignored, DECISION-tt.13) and rank by violation margin (DECISION-tt.10).
+    flagged: list[tuple[float, int, list[str]]] = []
+    for record in records:
+        margin = _violation_margin(record, below_rules, above_rules)
+        if margin is None:
+            continue
+        reasons = _flag_reasons(record, below_rules, above_rules)
+        flagged.append((margin, int(str(record["page_num"])), reasons))
+    flagged.sort(key=lambda item: (-item[0], item[1]))  # worst first, page ties stable
+    selected = flagged if top is None else flagged[:top]
+
+    rule_text = ", ".join(
+        [f"{s}<{t:g}" for s, t in below_rules] + [f"{s}>{t:g}" for s, t in above_rules]
+    )
+
+    out.mkdir(parents=True, exist_ok=True)
+    # Export loop: one page in memory at a time — render, write the jpg,
+    # OCR (cache-first), write the txt, keep only the 80-char index preview.
+    # Never accumulates JPEG bytes across pages (batching discipline for
+    # 100+ page galleries on the 15GB box).
+    index_rows: list[str] = []
+    for _margin, page_num, reasons in selected:
+        # render_pdf_page_jpeg = the concurrent-safe open/render/close entry
+        # point at the cache-key-standard 150dpi/q85 geometry — identical
+        # bytes to what ingest produced, so the sha256 hits the OCR cache.
+        jpeg_bytes = render_pdf_page_jpeg(
+            pdf_path, page_num, dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
+        )
+        (out / f"p{page_num:04d}.jpg").write_bytes(jpeg_bytes)
+        text = parser.ocr_text_for_jpeg(jpeg_bytes, page_num, pdf_path.name)
+        # Full text in the .txt (triage needs everything the engine saw);
+        # truncation happens only in the index preview. [DECISION-tt.12]
+        (out / f"p{page_num:04d}.txt").write_text(text, encoding="utf-8")
+        index_rows.append(
+            f"| {page_num} | {'; '.join(reasons)} | [p{page_num:04d}.jpg](p{page_num:04d}.jpg) "
+            f"| {_gallery_text_preview(text)} |"
+        )
+
+    # index.md: header states the inputs (pdf / rules / counts) so the
+    # gallery is self-describing when revisited weeks later; rows are
+    # already in worst-first order.
+    header = [
+        f"# OCR triage gallery — {pdf_path.name}",
+        "",
+        f"- source pdf: `{pdf_path.name}`",
+        f"- flag rules: {rule_text}",
+        f"- pages scanned: {len(records)}",
+        f"- flagged: {len(flagged)}",
+        f"- exported: {len(selected)}" + (f" (--top {top})" if top is not None else ""),
+        "",
+        "| page | trigger | image | text (first 80 chars) |",
+        "|---:|---|---|---|",
+    ]
+    (out / "index.md").write_text("\n".join(header + index_rows) + "\n", encoding="utf-8")
+
+    typer.echo(f"\n=== ocr-gallery: {pdf_path.name} ===")
+    typer.echo(f"  flag rules: {rule_text}")
+    typer.echo(f"  flagged: {len(flagged)}/{len(records)} page(s); exported: {len(selected)}")
+    typer.echo(f"  gallery: {out}/index.md")
+
+
 @app.command("redact-preview")
 def redact_preview(
     text_file: Annotated[Path, typer.Argument(exists=True, readable=True)],
