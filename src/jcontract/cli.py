@@ -249,6 +249,7 @@ def _build_parser(
     vision_model: str | None = None,
     profile: DomainProfile | None = None,
     auto_rotate: bool = False,
+    assembly: str = "default",
 ) -> PDFParser:
     """Select the PDFParser impl by name. Lazy imports keep heavy deps
     (anthropic / openai SDKs, pypdfium2 / sentence-transformers) out of
@@ -277,9 +278,17 @@ def _build_parser(
     vendors handle rotation inside the model and their lanes stay
     untouched (ssRT scope line) — so any other parser rejects the flag
     loudly instead of silently ignoring it.
+
+    ssGE: ``assembly`` selects the rapidocr reading-order mode ("default" =
+    frozen y-band sweep; "regions" = opt-in strip→column split for
+    side-by-side layouts, own cache namespace). rapidocr-only for the same
+    reason as auto_rotate: the LLM vendors assemble reading order inside
+    the model.
     """
     if auto_rotate and name != "rapidocr":
         raise typer.BadParameter("--auto-rotate is only supported by --parser rapidocr")
+    if assembly != "default" and name != "rapidocr":
+        raise typer.BadParameter("--assembly is only supported by --parser rapidocr")
     if name == "pypdf":
         return PyPdfParser()
     if name == "claude-vision":
@@ -306,7 +315,12 @@ def _build_parser(
         # profile / vision_model intentionally not forwarded: RapidOCR takes
         # no prompt — its output depends only on pixels + ONNX weights, so a
         # profile cannot change it and must not fork its cache namespace.
-        return RapidOcrParser(max_pages=max_pages, auto_rotate=auto_rotate)
+        # An unknown assembly mode raises ValueError in the constructor —
+        # surface it as the CLI usage error it is.
+        try:
+            return RapidOcrParser(max_pages=max_pages, auto_rotate=auto_rotate, assembly=assembly)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from None
     raise typer.BadParameter(
         f"Unknown parser '{name}'. "
         f"Choose from: pypdf, claude-vision, claude-cli-vision, deepseek-v4, rapidocr."
@@ -387,6 +401,17 @@ def ingest(
             ),
         ),
     ] = False,
+    assembly: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "rapidocr only (ssGE): reading-order assembly mode. "
+                "'default' = historical y-band sweep; 'regions' = split the "
+                "page into strips/columns first (fixes side-by-side "
+                "interleave; own OCR cache namespace '.regions')."
+            ),
+        ),
+    ] = "default",
 ) -> None:
     """Parse, chunk, embed, and index one PDF into Qdrant + BM25 + RefGraph."""
     # Phase 7: the DomainProfile drives prompts + chunking structure, and is
@@ -410,7 +435,12 @@ def ingest(
     try:
         pipeline = IngestPipeline(
             parser=_build_parser(
-                parser, max_pages, vision_model, profile=profile, auto_rotate=auto_rotate
+                parser,
+                max_pages,
+                vision_model,
+                profile=profile,
+                auto_rotate=auto_rotate,
+                assembly=assembly,
             ),
             chunker=QaAwareChunker(profile.structure),
             embedder=stack.embedder,
@@ -919,6 +949,22 @@ _QUALITY_SIGNALS = (
     "garbled_ratio",
 )
 
+# ssGE: page-geometry signals (computed from the OCR boxes, sidecar-stored
+# alongside the score metrics). Kept in their own tuple — the list above is
+# the FROZEN pre-registered set and must not change; flag rules and the
+# report accept the union. Records predating ssGE simply lack these keys →
+# null in the report, never triggering a rule (same null semantics,
+# DECISION-cq.20). [DECISION-pl.20/pl.21]
+_GEOMETRY_SIGNALS = (
+    "n_columns",
+    "max_band_gap",
+    "box_coverage",
+    "order_divergence",
+)
+
+# Every signal a --flag-below/--flag-above rule may reference.
+_FLAGGABLE_SIGNALS = _QUALITY_SIGNALS + _GEOMETRY_SIGNALS
+
 
 def _parse_flag_rules(specs: list[str], option_name: str) -> list[tuple[str, float]]:
     """Parse repeated ``<signal>:<value>`` flag specs into (signal, threshold).
@@ -930,10 +976,10 @@ def _parse_flag_rules(specs: list[str], option_name: str) -> list[tuple[str, flo
     rules: list[tuple[str, float]] = []
     for spec in specs:
         signal, sep, raw_value = spec.partition(":")
-        if not sep or signal not in _QUALITY_SIGNALS:
+        if not sep or signal not in _FLAGGABLE_SIGNALS:
             raise typer.BadParameter(
                 f"{option_name} expects <signal>:<value> with signal one of "
-                f"{', '.join(_QUALITY_SIGNALS)}; got {spec!r}"
+                f"{', '.join(_FLAGGABLE_SIGNALS)}; got {spec!r}"
             )
         try:
             rules.append((signal, float(raw_value)))
@@ -947,10 +993,16 @@ def _parse_flag_rules(specs: list[str], option_name: str) -> list[tuple[str, flo
 def _quality_report_record(metrics: dict[str, object]) -> dict[str, object]:
     """Project a metrics sidecar dict onto the per-page JSONL report record.
 
-    Emits the five pre-registered signals + garbled_ratio. ``non_alnum_ratio``
-    (the registered "非字母数字占比" signal) derives from the sidecar's stored
-    ``alnum_ratio`` as 1 - alnum_ratio; the raw per-box score list stays in
-    the sidecar (lossless record) and out of the report (readable record).
+    Emits the five pre-registered signals + garbled_ratio + the ssGE
+    geometry signals. ``non_alnum_ratio`` (the registered "非字母数字占比"
+    signal) derives from the sidecar's stored ``alnum_ratio`` as
+    1 - alnum_ratio; the raw per-box score list stays in the sidecar
+    (lossless record) and out of the report (readable record).
+
+    Geometry keys are read with .get on purpose: a pre-ssGE sidecar (or an
+    archived pre-ssGE JSONL replayed through ocr-gallery) lacks them — the
+    report then carries null, which no flag rule ever triggers on.
+    [DECISION-pl.21]
     """
 
     def _round4(value: object) -> float | None:
@@ -967,6 +1019,10 @@ def _quality_report_record(metrics: dict[str, object]) -> dict[str, object]:
             round(1.0 - alnum_ratio, 4) if isinstance(alnum_ratio, int | float) else None
         ),
         "garbled_ratio": _round4(metrics.get("garbled_ratio")),
+        "n_columns": metrics.get("n_columns"),
+        "max_band_gap": _round4(metrics.get("max_band_gap")),
+        "box_coverage": _round4(metrics.get("box_coverage")),
+        "order_divergence": _round4(metrics.get("order_divergence")),
     }
     if "engine_error" in metrics:
         record["engine_error"] = metrics["engine_error"]
@@ -1018,7 +1074,7 @@ def ocr_quality(
             help=(
                 "Flag pages where <signal> is BELOW <value>, e.g. "
                 "--flag-below mean_score:0.85 (repeatable; rules OR together). "
-                f"Signals: {', '.join(_QUALITY_SIGNALS)}."
+                f"Signals: {', '.join(_FLAGGABLE_SIGNALS)}."
             ),
         ),
     ] = None,
@@ -1033,12 +1089,26 @@ def ocr_quality(
             ),
         ),
     ] = None,
+    assembly: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "Reading-order assembly mode for the scan (ssGE): 'default' "
+                "| 'regions'. A non-default mode reads/writes its own "
+                "'.regions' cache namespace; geometry signals are "
+                "assembly-independent."
+            ),
+        ),
+    ] = "default",
 ) -> None:
     """Per-page OCR quality report for the rapidocr lane (ssQA).
 
     Emits one JSONL record per page with the five pre-registered quality
     signals (mean_score, min_score, low_score_ratio, boxes, non_alnum_ratio)
-    plus the garbled-text heuristic (garbled_ratio), and a terminal summary.
+    plus the garbled-text heuristic (garbled_ratio) and the ssGE page-
+    geometry signals (n_columns, max_band_gap, box_coverage,
+    order_divergence — null on records computed before ssGE), and a
+    terminal summary.
 
     Locate + mark ONLY: this command ships NO built-in thresholds — pass
     them via --flag-below/--flag-above once the L5 calibration has derived
@@ -1056,7 +1126,11 @@ def ocr_quality(
     below_rules = _parse_flag_rules(flag_below or [], "--flag-below")
     above_rules = _parse_flag_rules(flag_above or [], "--flag-above")
 
-    parser = RapidOcrParser(max_pages=max_pages)
+    # Unknown assembly mode raises ValueError in the constructor → usage error.
+    try:
+        parser = RapidOcrParser(max_pages=max_pages, assembly=assembly)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
     pages = parser.quality_metrics(pdf_path)
 
     records: list[dict[str, object]] = []
@@ -1079,7 +1153,7 @@ def ocr_quality(
     # signal is defined (nulls excluded), then the flagged-page roll-up.
     typer.echo(f"\n=== ocr-quality: {pdf_path.name} ({len(records)} pages) ===")
     typer.echo(f"  {'signal':<16} {'mean':>8} {'min':>8} {'max':>8} {'n_def':>6}")
-    for signal in _QUALITY_SIGNALS:
+    for signal in _FLAGGABLE_SIGNALS:
         values = [v for r in records if isinstance(v := r.get(signal), int | float)]
         if values:
             mean_v = sum(values) / len(values)
@@ -1188,7 +1262,7 @@ def ocr_gallery(
             help=(
                 "Select pages where <signal> is BELOW <value>, e.g. "
                 "--flag-below min_score:0.756 (repeatable; rules OR together). "
-                f"Signals: {', '.join(_QUALITY_SIGNALS)}."
+                f"Signals: {', '.join(_FLAGGABLE_SIGNALS)}."
             ),
         ),
     ] = None,
@@ -1207,6 +1281,16 @@ def ocr_gallery(
         int | None,
         typer.Option(help="Export only the worst N flagged pages. None = all flagged."),
     ] = None,
+    assembly: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "Reading-order assembly mode for the exported OCR text "
+                "(ssGE): 'default' | 'regions'. Lets a triager eyeball the "
+                "region-aware reading order next to the page image."
+            ),
+        ),
+    ] = "default",
 ) -> None:
     """Export low-quality OCR pages as a human-triage gallery (ssTG).
 
@@ -1248,7 +1332,11 @@ def ocr_gallery(
             "ocr-gallery needs at least one selection rule: pass --flag-below/--flag-above"
         )
 
-    parser = RapidOcrParser()
+    # Unknown assembly mode raises ValueError in the constructor → usage error.
+    try:
+        parser = RapidOcrParser(assembly=assembly)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
 
     # Per-page quality records: archived JSONL when supplied, fresh scan
     # otherwise (identical projection to what ocr-quality writes).

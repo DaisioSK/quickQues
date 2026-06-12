@@ -48,6 +48,7 @@ OCR-fidelity comparison (docs/localstack-ocr-compare.md, project repo).
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import threading
@@ -57,9 +58,11 @@ from typing import Any, ClassVar
 
 import pypdfium2 as pdfium
 import structlog
+from PIL import Image
 
 from jcontract.impls._ocr_cache_key import model_cache_suffix
 from jcontract.impls._page_classify import _classify_page
+from jcontract.impls._page_geometry import assemble_regions, page_geometry
 from jcontract.impls._page_orient import probe_rotation, rotate_jpeg
 from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.interfaces import PageKind, ParsedPage
@@ -79,6 +82,14 @@ DEFAULT_JPEG_QUALITY = 85
 # the constructor; a non-default choice gets its own cache namespace.
 DEFAULT_MODEL_TYPE = "mobile"
 _MODEL_SLUG_TEMPLATE = "ppocrv5-{model_type}"
+
+# ssGE: the two reading-order assembly modes. "default" is the historical
+# y-band sweep (_assemble_reading_order, frozen); "regions" is the opt-in
+# strip→column split (impls._page_geometry.assemble_regions). A non-default
+# mode produces DIFFERENT text from the same pixels, so it forks the cache
+# namespace exactly like a non-default model does. [DECISION-pl.22]
+DEFAULT_ASSEMBLY = "default"
+ASSEMBLY_MODES = ("default", "regions")
 
 # ssQA: per-box recognition scores below this count as "low confidence" in
 # the metrics sidecar (`low_score_ratio`). 0.7 is part of the FROZEN
@@ -185,6 +196,19 @@ def _assemble_reading_order(boxes: Sequence[Sequence[Sequence[float]]], txts: Se
     return "\n".join(" ".join(txt for _, txt in sorted(line)) for line in lines)
 
 
+def _jpeg_size(jpeg_bytes: bytes) -> tuple[int, int]:
+    """(width, height) of a JPEG frame — header parse only, no pixel decode.
+
+    PIL defers pixel decoding until the raster is actually accessed, so
+    reading ``.size`` costs microseconds; cheap enough to run on every
+    engine pass (geometry signals need the page extent for their relative
+    thresholds, ssGE).
+    """
+    with Image.open(io.BytesIO(jpeg_bytes)) as img:
+        width, height = img.size
+    return int(width), int(height)
+
+
 class RapidOcrParser:
     """PDFParser that OCRs scanned PDFs locally via RapidOCR (PP-OCRv5, CPU).
 
@@ -209,6 +233,7 @@ class RapidOcrParser:
         engine: Callable[[bytes], Any] | None = None,
         auto_classify: bool = True,
         auto_rotate: bool = False,
+        assembly: str = DEFAULT_ASSEMBLY,
     ) -> None:
         # Tests inject a fake ``engine`` callable; production lazily builds
         # the real RapidOCR pipeline on first use (_ensure_engine) so that
@@ -234,6 +259,18 @@ class RapidOcrParser:
         # own cache key — zero collision with the original namespace).
         # Default False = zero behaviour change for every existing caller.
         self._auto_rotate = auto_rotate
+        # ssGE: opt-in reading-order assembly mode. "regions" re-orders the
+        # SAME OCR boxes (strip→column split) — engine, scores and rotation
+        # decisions are untouched; only the assembled text differs. Default
+        # "default" = the frozen y-band sweep, zero behaviour change.
+        if assembly not in ASSEMBLY_MODES:
+            raise ValueError(f"assembly must be one of {ASSEMBLY_MODES}, got {assembly!r}")
+        self._assembly = assembly
+        # Non-default assembly forks the .txt/.metrics cache namespace via
+        # the same suffix mechanism as a non-default model ('' for default,
+        # '.regions' otherwise) — existing caches are never polluted.
+        # [DECISION-pl.22]
+        self._assembly_suffix = model_cache_suffix(assembly, DEFAULT_ASSEMBLY)
         # RapidOCR's pipeline mutates per-call internal buffers; nothing in
         # the codebase calls this vendor concurrently today (batch-ingest
         # only wires the network vendors), but the lock makes _ocr_jpeg
@@ -364,20 +401,28 @@ class RapidOcrParser:
         """OCR text cache file for these JPEG bytes.
 
         Vendor prefix + "text" kind (this vendor never produces drawing
-        captions) + model suffix. Profile deliberately absent — see module
-        docstring.
+        captions) + model suffix + assembly suffix (ssGE: '' for the
+        default mode, '.regions' otherwise — a non-default assembly emits
+        different text, so it owns its namespace, DECISION-pl.22).
+        Profile deliberately absent — see module docstring.
         """
-        return self._cache_dir / f"{self.cache_prefix}-{cache_key}.text{self._model_suffix}.txt"
+        return self._cache_dir / (
+            f"{self.cache_prefix}-{cache_key}.text{self._model_suffix}{self._assembly_suffix}.txt"
+        )
 
     def _metrics_path(self, cache_key: str) -> Path:
         """Quality-metrics sidecar for these JPEG bytes (ssQA).
 
         Same namespace rules as the .txt: vendor prefix + content hash +
-        model suffix — `rapidocr-<sha256>.metrics[.<model>].json`. A
-        non-default model OCRs differently, so its scores live in their
-        own sidecar namespace exactly like its text does.
+        model suffix + assembly suffix —
+        `rapidocr-<sha256>.metrics[.<model>][.regions].json`. The sidecar
+        pairs 1:1 with its .txt (the probe read path requires both), so it
+        follows the same namespace forks.
         """
-        return self._cache_dir / f"{self.cache_prefix}-{cache_key}.metrics{self._model_suffix}.json"
+        return self._cache_dir / (
+            f"{self.cache_prefix}-{cache_key}"
+            f".metrics{self._model_suffix}{self._assembly_suffix}.json"
+        )
 
     def _rotation_path(self, cache_key: str) -> Path:
         """Rotation-decision sidecar for these ORIGINAL frame bytes (ssRT).
@@ -387,6 +432,12 @@ class RapidOcrParser:
         before the decision exists). Model-suffixed like the .txt/.metrics
         sidecars: the probe ranks ENGINE output, so a different model may
         legitimately decide differently. [DECISION-pl.12]
+
+        Deliberately NOT assembly-suffixed (ssGE): the probe ranks frames
+        by OCR mass = non-whitespace chars × mean score, and re-ordering
+        the same boxes changes neither — both assembly modes provably
+        reach the same verdict, so they share one sidecar (no re-probe
+        when switching modes). [DECISION-pl.22]
         """
         return (
             self._cache_dir / f"{self.cache_prefix}-{cache_key}.rotation{self._model_suffix}.json"
@@ -444,6 +495,24 @@ class RapidOcrParser:
         )
         return rotation
 
+    def _assembled_text(self, result: Any, jpeg_bytes: bytes) -> str:
+        """Reading-order text for one engine result, per the assembly mode.
+
+        Blank page (txts/boxes None or empty) normalises to "" in both
+        modes. "default" goes through the frozen ``_assemble_reading_order``
+        path untouched; "regions" routes the SAME boxes through the
+        strip→column splitter, which needs the frame's pixel size for its
+        relative gap thresholds (ssGE). Geometry must see the upright
+        frame: every caller passes the post-rotation jpeg_bytes (the
+        auto-rotate step happens before any OCR/assembly).
+        """
+        if result.txts is None or result.boxes is None or len(result.txts) == 0:
+            return ""
+        if self._assembly == "regions":
+            width, height = _jpeg_size(jpeg_bytes)
+            return assemble_regions(result.boxes, result.txts, width, height)
+        return _assemble_reading_order(result.boxes, result.txts)
+
     def _ocr_with_scores(
         self, jpeg_bytes: bytes, page_num: int, pdf_name: str
     ) -> tuple[str, list[float]] | None:
@@ -481,16 +550,13 @@ class RapidOcrParser:
             )
             return None
 
-        if result.txts is None or result.boxes is None or len(result.txts) == 0:
-            text = ""
-        else:
-            text = _assemble_reading_order(result.boxes, result.txts)
+        text = self._assembled_text(result, jpeg_bytes)
         scores = [] if result.scores is None else [float(s) for s in result.scores]
 
         if not text_path.exists():
             text_path.write_text(text, encoding="utf-8")
         if not metrics_path.exists():
-            self._write_metrics_sidecar(cache_key, page_num, result, text)
+            self._write_metrics_sidecar(cache_key, page_num, result, text, jpeg_bytes)
         return text, scores
 
     def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
@@ -544,17 +610,15 @@ class RapidOcrParser:
         # Blank page → RapidOCR returns txts=None/boxes=None (verified
         # 2026-06-11). Normalise to "" — cached, so blank pages cost one
         # OCR pass ever, matching the sentinel handling of the LLM vendors.
-        if result.txts is None or result.boxes is None or len(result.txts) == 0:
-            text = ""
-        else:
-            text = _assemble_reading_order(result.boxes, result.txts)
+        # Assembly-mode dispatch lives inside _assembled_text (ssGE).
+        text = self._assembled_text(result, jpeg_bytes)
 
         cache_path.write_text(text, encoding="utf-8")
         # ssQA: the engine ran, so the per-box scores exist exactly now —
         # persist them or lose them (a later cache hit never re-runs the
         # engine). json.dump of a few hundred floats is negligible next to
         # the ~1s OCR pass, so ingest-path cost is unchanged in substance.
-        self._write_metrics_sidecar(cache_key, page_num, result, text)
+        self._write_metrics_sidecar(cache_key, page_num, result, text, jpeg_bytes)
         logger.info(
             "rapidocr_parser.ocr_complete",
             pdf=pdf_name,
@@ -584,11 +648,32 @@ class RapidOcrParser:
         return self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
 
     def _write_metrics_sidecar(
-        self, cache_key: str, page_num: int, result: Any, text: str
+        self, cache_key: str, page_num: int, result: Any, text: str, jpeg_bytes: bytes
     ) -> dict[str, Any]:
-        """Compute + persist the quality-metrics sidecar for one engine run."""
+        """Compute + persist the quality-metrics sidecar for one engine run.
+
+        ssGE: the score/char metrics (ssQA schema) are extended with the
+        page-geometry signals — computed here, at engine-run time, because
+        the boxes exist exactly now (a cache hit never re-runs the engine,
+        same persistence stance as the scores). Pre-ssGE sidecars simply
+        lack the geometry keys; readers treat the missing signals as null
+        (`geometry_version` stamps the formula generation).
+        [DECISION-pl.21]
+        """
         scores: Sequence[float] = () if result.scores is None else result.scores
         metrics = _page_metrics(page_num, scores, text)
+        # Geometry needs the frame extent for its relative thresholds. A
+        # frame PIL cannot parse (never produced by the render path; seen
+        # only with injected stand-in bytes) degrades to a pre-ssGE-shaped
+        # sidecar — readers already treat missing geometry keys as null,
+        # so "no geometry" is a defined, not exceptional, state.
+        try:
+            width, height = _jpeg_size(jpeg_bytes)
+        except Exception:  # noqa: BLE001 — geometry must never break the OCR path
+            logger.warning("rapidocr_parser.geometry_skipped_unreadable_frame", page=page_num)
+        else:
+            boxes = result.boxes if result.boxes is not None else []
+            metrics.update(page_geometry(boxes, width, height))
         self._metrics_path(cache_key).write_text(
             json.dumps(metrics, ensure_ascii=False), encoding="utf-8"
         )
@@ -670,12 +755,9 @@ class RapidOcrParser:
             degenerate.update({"boxes": None, "engine_error": type(exc).__name__})
             return degenerate
 
-        if result.txts is None or result.boxes is None or len(result.txts) == 0:
-            text = ""
-        else:
-            text = _assemble_reading_order(result.boxes, result.txts)
+        text = self._assembled_text(result, jpeg_bytes)
 
         text_path = self._text_cache_path(cache_key)
         if not text_path.exists():
             text_path.write_text(text, encoding="utf-8")
-        return self._write_metrics_sidecar(cache_key, page_num, result, text)
+        return self._write_metrics_sidecar(cache_key, page_num, result, text, jpeg_bytes)

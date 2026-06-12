@@ -313,3 +313,157 @@ def test_cli_non_numeric_threshold_is_usage_error(cli_engine):
         ["ocr-quality", str(SYNTHETIC_PDF), "--max-pages", "1", "--flag-below", "mean_score:abc"],
     )
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# ssGE geometry signals: sidecar fields, pre-ssGE compat, CLI flag rules
+# ---------------------------------------------------------------------------
+
+
+def test_engine_run_sidecar_carries_geometry_signals(tmp_path):
+    """An engine run persists the ssGE geometry block alongside the ssQA
+    score metrics (same write-once timing). [DECISION-pl.21]"""
+    cache_dir = tmp_path / "cache"
+    # Two side-by-side columns, two boxes each: n_columns=2, in-line gap.
+    boxes = [
+        _box(100, 100, 450, 130),
+        _box(620, 105, 1000, 135),
+        _box(100, 140, 450, 170),
+        _box(620, 145, 1000, 175),
+    ]
+    engine = _make_engine(boxes, ("L1", "R1", "L2", "R2"))
+    RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1).parse(SYNTHETIC_PDF)
+
+    (sidecar,) = cache_dir.glob("rapidocr-*.metrics.json")
+    metrics = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert metrics["geometry_version"] == 1
+    assert metrics["n_columns"] == 2
+    assert metrics["max_band_gap"] > 0.1
+    assert 0.0 < metrics["box_coverage"] < 1.0
+    assert metrics["order_divergence"] > 0.0
+
+
+def test_quality_metrics_reads_pre_ssge_sidecar_without_geometry(tmp_path):
+    """A pre-ssGE sidecar (no geometry keys) must read back as-is: no
+    engine run, no crash, geometry simply absent. W6 replays archived 45c
+    sidecars/JSONL — backward read compatibility is a hard requirement."""
+    cache_dir = tmp_path / "cache"
+    engine_1 = _make_engine([_box(10, 10, 100, 40)], ("old text",), scores=(0.7,))
+    RapidOcrParser(cache_dir=cache_dir, engine=engine_1, max_pages=1).parse(SYNTHETIC_PDF)
+    (sidecar,) = cache_dir.glob("rapidocr-*.metrics.json")
+    old = json.loads(sidecar.read_text(encoding="utf-8"))
+    geometry_keys = (
+        "geometry_version",
+        "n_columns",
+        "max_band_gap",
+        "box_coverage",
+        "order_divergence",
+    )
+    for key in geometry_keys:
+        old.pop(key)
+    sidecar.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+
+    engine_2 = _make_engine([_box(10, 10, 100, 40)], ("SHOULD NOT RUN",))
+    records = RapidOcrParser(cache_dir=cache_dir, engine=engine_2, max_pages=1).quality_metrics(
+        SYNTHETIC_PDF
+    )
+
+    assert engine_2.call_count == 0  # sidecar-first read still holds
+    assert "n_columns" not in records[0]
+
+
+def test_cli_report_nulls_geometry_on_pre_ssge_records(tmp_path, monkeypatch):
+    """ocr-quality over a pre-ssGE sidecar: geometry columns are null in the
+    JSONL and a geometry flag rule never triggers on them (null semantics,
+    DECISION-cq.20/pl.21)."""
+    monkeypatch.chdir(tmp_path)
+    cache_dir = Path("data/ocr_cache")
+    engine = _make_engine([_box(10, 10, 100, 40)], ("legacy page",), scores=(0.9,))
+    monkeypatch.setattr(RapidOcrParser, "_ensure_engine", lambda self: engine)
+    RapidOcrParser(cache_dir=cache_dir, max_pages=1).parse(SYNTHETIC_PDF)
+    (sidecar,) = cache_dir.glob("rapidocr-*.metrics.json")
+    old = json.loads(sidecar.read_text(encoding="utf-8"))
+    geometry_keys = (
+        "geometry_version",
+        "n_columns",
+        "max_band_gap",
+        "box_coverage",
+        "order_divergence",
+    )
+    for key in geometry_keys:
+        old.pop(key)
+    sidecar.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "ocr-quality",
+            str(SYNTHETIC_PDF),
+            "--max-pages",
+            "1",
+            "--flag-above",
+            "order_divergence:0.0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    records = [json.loads(line) for line in result.output.splitlines() if line.startswith("{")]
+    assert records[0]["n_columns"] is None
+    assert records[0]["order_divergence"] is None
+    assert records[0]["flagged"] is False  # null never triggers a rule
+
+
+def test_cli_geometry_flag_rule_triggers_on_fresh_scan(tmp_path, monkeypatch):
+    """New scans expose the geometry signals to --flag rules plug-and-play:
+    a two-column page trips --flag-above n_columns:1."""
+    monkeypatch.chdir(tmp_path)
+    boxes = [
+        _box(100, 100, 450, 130),
+        _box(620, 105, 1000, 135),
+        _box(100, 140, 450, 170),
+        _box(620, 145, 1000, 175),
+    ]
+    engine = _make_engine(boxes, ("L1", "R1", "L2", "R2"))
+    monkeypatch.setattr(RapidOcrParser, "_ensure_engine", lambda self: engine)
+
+    result = runner.invoke(
+        app,
+        [
+            "ocr-quality",
+            str(SYNTHETIC_PDF),
+            "--max-pages",
+            "1",
+            "--flag-above",
+            "n_columns:1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    records = [json.loads(line) for line in result.output.splitlines() if line.startswith("{")]
+    assert records[0]["n_columns"] == 2
+    assert records[0]["flagged"] is True
+    assert records[0]["flag_reasons"] == ["n_columns=2>1"]
+
+
+def test_cli_assembly_regions_scans_into_own_namespace(tmp_path, monkeypatch):
+    """ocr-quality --assembly regions writes .regions-suffixed artifacts and
+    leaves the default namespace empty. [DECISION-pl.22]"""
+    monkeypatch.chdir(tmp_path)
+    engine = _make_engine([_box(10, 10, 100, 40)], ("solo line",), scores=(0.9,))
+    monkeypatch.setattr(RapidOcrParser, "_ensure_engine", lambda self: engine)
+
+    result = runner.invoke(
+        app,
+        ["ocr-quality", str(SYNTHETIC_PDF), "--max-pages", "1", "--assembly", "regions"],
+    )
+    assert result.exit_code == 0, result.output
+    cache_dir = Path("data/ocr_cache")
+    assert len(list(cache_dir.glob("rapidocr-*.metrics.regions.json"))) == 1
+    assert list(cache_dir.glob("rapidocr-*.metrics.json")) == []
+
+
+def test_cli_unknown_assembly_is_usage_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["ocr-quality", str(SYNTHETIC_PDF), "--max-pages", "1", "--assembly", "diagonal"]
+    )
+    assert result.exit_code != 0
+    assert "assembly" in result.output

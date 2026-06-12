@@ -131,6 +131,29 @@ uv run jcontract ingest scan.pdf --parser rapidocr --auto-rotate
 uv run jcontract table-preview scan.pdf --page 9 --auto-rotate --format elements
 ```
 
+#### Region-aware assembly (`--assembly regions`, rapidocr only, opt-in)
+
+The default reading-order assembly sweeps boxes top-to-bottom in y bands, which
+interleaves side-by-side layouts (two columns, label/value tables) into mixed lines.
+`--assembly regions` (default: `default` — zero behaviour change) splits the page into
+horizontal strips on empty y bands, splits each strip into columns on empty x channels,
+and reads columns left-to-right, so column text comes out contiguous. A non-default
+mode caches into its own `.regions`-suffixed namespace (`rapidocr-<sha>.text.regions.txt`)
+and never touches existing cache entries. Available on `ingest`, `ocr-quality`, and
+`ocr-gallery`.
+
+Layout problems are also *detectable* before opting in: every fresh OCR pass stores four
+page-geometry signals in the metrics sidecar — `n_columns` (empty-channel column count),
+`max_band_gap` (widest in-line blank, fraction of page width), `box_coverage` (text-box
+area / page area), `order_divergence` (how much the default and region orders disagree) —
+and `ocr-quality`/`ocr-gallery` accept them in `--flag-below`/`--flag-above` rules.
+Records written before this feature simply report `null` for these signals.
+
+```bash
+uv run jcontract ocr-quality scan.pdf --flag-above n_columns:1 --flag-above max_band_gap:0.25
+uv run jcontract ingest scan.pdf --parser rapidocr --assembly regions
+```
+
 ### Redaction preview (`redact-preview`)
 
 Reversible pseudonymization for confidential corpora — a standalone mechanism component

@@ -319,3 +319,86 @@ def test_auto_rotate_engine_error_degrades_to_zero_and_does_not_cache(tmp_path):
     assert pages[0].text == ""
     assert list(cache_dir.glob("*.rotation*.json")) == []
     assert list(cache_dir.glob("rapidocr-*.txt")) == []
+
+
+# ---------------------------------------------------------------------------
+# ssGE regions assembly: opt-in mode, cache namespace, default regression
+# ---------------------------------------------------------------------------
+
+
+def _two_column_fixture() -> tuple[list[list[list[float]]], tuple[str, ...]]:
+    """Side-by-side columns that the default sweep interleaves.
+
+    Geometry relative to the synthetic fixture render (1275px wide at
+    150dpi): a >12px channel between x=450 and x=620 with >=2 boxes per
+    side, row spacing under the 1% strip threshold.
+    """
+    boxes = [
+        _box(100, 100, 450, 130),
+        _box(620, 105, 1000, 135),
+        _box(100, 140, 450, 170),
+        _box(620, 145, 1000, 175),
+    ]
+    return boxes, ("L1", "R1", "L2", "R2")
+
+
+def test_regions_assembly_orders_columns_and_forks_cache(tmp_path):
+    """assembly='regions' un-interleaves columns AND lands in its own
+    `.regions` cache namespace — the default namespace stays untouched.
+    [DECISION-pl.22]"""
+    cache_dir = tmp_path / "cache"
+    boxes, txts = _two_column_fixture()
+    pages = RapidOcrParser(
+        cache_dir=cache_dir, engine=_make_engine(boxes, txts), max_pages=1, assembly="regions"
+    ).parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "L1\nL2\nR1\nR2"
+    assert len(list(cache_dir.glob("rapidocr-*.text.regions.txt"))) == 1
+    assert len(list(cache_dir.glob("rapidocr-*.metrics.regions.json"))) == 1
+    # No default-namespace artifacts were created or rewritten.
+    assert list(cache_dir.glob("rapidocr-*.text.txt")) == []
+    assert list(cache_dir.glob("rapidocr-*.metrics.json")) == []
+
+
+def test_default_assembly_unchanged_and_blind_to_regions_cache(tmp_path):
+    """The same page parsed in both modes: default output is the historical
+    interleaved sweep, and each mode reads only its own namespace."""
+    cache_dir = tmp_path / "cache"
+    boxes, txts = _two_column_fixture()
+
+    default_pages = RapidOcrParser(
+        cache_dir=cache_dir, engine=_make_engine(boxes, txts), max_pages=1
+    ).parse(SYNTHETIC_PDF)
+    assert default_pages[0].text == "L1 R1\nL2 R2"
+
+    regions_engine = _make_engine(boxes, txts)
+    regions_pages = RapidOcrParser(
+        cache_dir=cache_dir, engine=regions_engine, max_pages=1, assembly="regions"
+    ).parse(SYNTHETIC_PDF)
+    # Different namespace -> the regions parser cannot reuse the default
+    # .txt and must run the engine once itself.
+    assert regions_engine.call_count == 1
+    assert regions_pages[0].text == "L1\nL2\nR1\nR2"
+    # Both namespaces now coexist; the default file kept its bytes.
+    assert len(list(cache_dir.glob("rapidocr-*.text.txt"))) == 1
+    assert len(list(cache_dir.glob("rapidocr-*.text.regions.txt"))) == 1
+
+
+def test_regions_second_parse_is_pure_cache_hit(tmp_path):
+    cache_dir = tmp_path / "cache"
+    boxes, txts = _two_column_fixture()
+    RapidOcrParser(
+        cache_dir=cache_dir, engine=_make_engine(boxes, txts), max_pages=1, assembly="regions"
+    ).parse(SYNTHETIC_PDF)
+
+    engine_2 = _make_engine(boxes, ("SHOULD", "NOT", "BE", "RETURNED"))
+    pages = RapidOcrParser(
+        cache_dir=cache_dir, engine=engine_2, max_pages=1, assembly="regions"
+    ).parse(SYNTHETIC_PDF)
+    assert engine_2.call_count == 0
+    assert pages[0].text == "L1\nL2\nR1\nR2"
+
+
+def test_unknown_assembly_mode_raises():
+    with pytest.raises(ValueError, match="assembly"):
+        RapidOcrParser(assembly="diagonal")
