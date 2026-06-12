@@ -64,7 +64,13 @@ from PIL import Image
 from jcontract.impls._ocr_cache_key import model_cache_suffix
 from jcontract.impls._page_classify import _classify_page, classify_page_v2
 from jcontract.impls._page_geometry import assemble_regions, page_geometry
-from jcontract.impls._page_orient import probe_rotation, rotate_jpeg
+from jcontract.impls._page_orient import (
+    GATE_MIN_SCORE,
+    _probe_record,
+    ocr_mass,
+    probe_rotation,
+    rotate_jpeg,
+)
 from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.interfaces import PageKind, ParsedPage
 
@@ -100,6 +106,18 @@ CLASSIFY_ENV_VAR = "JCONTRACT_PAGE_CLASSIFY"
 # namespace exactly like a non-default model does. [DECISION-pl.22]
 DEFAULT_ASSEMBLY = "default"
 ASSEMBLY_MODES = ("default", "regions")
+
+# ssHD: DPI-escalation rescue. A page whose standard-frame OCR is still low
+# quality AFTER the (optional) ssRT rotation fix gets re-rendered at
+# RESCUE_DPI, re-read, and the better result wins. Exactly one 150→300 step —
+# a dpi ladder (→600, per-page-kind dpi) is explicitly out of scope
+# (FORESHADOW-pl.2). The gate REUSES the ssRT low-quality semantics
+# ("min_score < threshold, or zero boxes", DECISION-pl.11) and the same
+# 0.756 default value, but the threshold is an independent constructor knob
+# (rescue_min_score) — the probe lane and the rescue lane may legitimately
+# diverge once the W6 calibration numbers exist. [DECISION-pl.40]
+RESCUE_DPI = 300
+RESCUE_MIN_SCORE = GATE_MIN_SCORE
 
 # ssQA: per-box recognition scores below this count as "low confidence" in
 # the metrics sidecar (`low_score_ratio`). 0.7 is part of the FROZEN
@@ -265,6 +283,8 @@ class RapidOcrParser:
         auto_rotate: bool = False,
         assembly: str = DEFAULT_ASSEMBLY,
         classify_version: str | None = None,
+        dpi_rescue: bool = False,
+        rescue_min_score: float = RESCUE_MIN_SCORE,
     ) -> None:
         # Tests inject a fake ``engine`` callable; production lazily builds
         # the real RapidOCR pipeline on first use (_ensure_engine) so that
@@ -309,6 +329,17 @@ class RapidOcrParser:
         # '.regions' otherwise) — existing caches are never polluted.
         # [DECISION-pl.22]
         self._assembly_suffix = model_cache_suffix(assembly, DEFAULT_ASSEMBLY)
+        # ssHD: opt-in DPI-escalation rescue. When True, a page whose
+        # standard-frame OCR is still low quality (shared ssRT gate
+        # semantics, independent rescue_min_score threshold) is re-rendered
+        # at RESCUE_DPI on the UPRIGHT frame, re-read, and the higher
+        # ocr_mass result wins. Decision + evidence persist in a .rescue
+        # sidecar keyed by the standard frame's sha256, so re-ingest never
+        # re-pays the hi-dpi render/OCR (same anti-rerun stance as the
+        # rotation sidecar, DECISION-pl.12). Default False = zero behaviour
+        # change for every existing caller. [DECISION-pl.40]
+        self._dpi_rescue = dpi_rescue
+        self._rescue_min_score = rescue_min_score
         # RapidOCR's pipeline mutates per-call internal buffers; nothing in
         # the codebase calls this vendor concurrently today (batch-ingest
         # only wires the network vendors), but the lock makes _ocr_jpeg
@@ -398,6 +429,12 @@ class RapidOcrParser:
         signals come from the metrics sidecar the OCR step just wrote. v1
         never reads OCR output, so the shared ordering changes nothing for
         it. [DECISION-pl.33]
+
+        ssHD ordering: the rescue runs AFTER rotation (escalating a
+        sideways frame would be wasted — the engine reads fragments at any
+        dpi) and only replaces ``text``; classification keeps judging the
+        standard 150dpi upright frame (ssVR reads that frame's sidecar —
+        rescue is orthogonal to it). [DECISION-pl.40]
         """
         jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
         rotation = 0
@@ -406,6 +443,8 @@ class RapidOcrParser:
             if rotation:
                 jpeg_bytes = rotate_jpeg(jpeg_bytes, rotation, jpeg_quality=self._jpeg_quality)
         text = self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
+        if self._dpi_rescue:
+            text = self._rescue_text(page, jpeg_bytes, text, rotation, page_num, pdf_name)
         return ParsedPage(
             page_num=page_num,
             text=text,
@@ -575,6 +614,148 @@ class RapidOcrParser:
             cache_key=cache_key[:12],
         )
         return rotation
+
+    def _rescue_path(self, cache_key: str) -> Path:
+        """Rescue-decision sidecar for these STANDARD (upright) frame bytes (ssHD).
+
+        `rapidocr-<sha256>.rescue[.<model>].json` — keyed by the standard
+        frame's hash, exactly like the rotation sidecar: the decision must
+        be findable before the hi-dpi frame exists. Model-suffixed (a
+        different model may decide differently) but deliberately NOT
+        assembly-suffixed: the verdict ranks ocr_mass = non-whitespace
+        chars × mean score, and re-ordering the same boxes changes neither
+        — both assembly modes provably reach the same verdict, so they
+        share one sidecar (same reasoning as the rotation sidecar,
+        DECISION-pl.22). [DECISION-pl.40]
+        """
+        return self._cache_dir / f"{self.cache_prefix}-{cache_key}.rescue{self._model_suffix}.json"
+
+    def _escalated_frame(self, page: pdfium.PdfPage, rotation: int) -> bytes:
+        """Render the RESCUE_DPI frame and apply the ALREADY-DECIDED rotation.
+
+        The rotation decision was made on the standard frame (probe already
+        paid, sidecar-cached) — escalating must reuse it, not re-probe: the
+        hi-dpi render of the same page is upright iff the standard render
+        was, and escalating a still-sideways frame would be wasted effort.
+        Deterministic render + deterministic rotate ⇒ the escalated frame's
+        sha256 is stable across runs — its OCR text/metrics live in their
+        own content-addressed cache entries, zero collision with the
+        standard frame's namespace by construction. [DECISION-pl.40]
+        """
+        jpeg_bytes = render_page_jpeg(page, dpi=RESCUE_DPI, jpeg_quality=self._jpeg_quality)
+        if rotation:
+            jpeg_bytes = rotate_jpeg(jpeg_bytes, rotation, jpeg_quality=self._jpeg_quality)
+        return jpeg_bytes
+
+    def _rescue_text(
+        self,
+        page: pdfium.PdfPage,
+        base_jpeg: bytes,
+        base_text: str,
+        rotation: int,
+        page_num: int,
+        pdf_name: str,
+    ) -> str:
+        """DPI-escalation rescue for one already-OCR'd page (ssHD, opt-in).
+
+        Flow:
+          1. Sidecar hit → replay the stored decision: "base" returns the
+             standard text as-is; "escalated" re-derives the hi-dpi frame
+             (render+rotate are deterministic) and reads its text as a pure
+             cache hit — re-ingest never re-pays the rescue OCR.
+          2. Gate from the standard frame's metrics sidecar (just written by
+             the engine run, or probe-prewarmed under auto-rotate): rescue
+             only when ``min_score < rescue_min_score`` or zero boxes —
+             shared ssRT semantics, independent threshold. A page without a
+             sidecar (pre-ssQA cache hit) SKIPS rescue with a log:
+             backfilling would force an engine run inside ingest
+             (DECISION-cq.21 forbids) — re-OCR into a fresh cache when full
+             rescue coverage matters. A healthy page writes no sidecar (the
+             gate re-check is one cheap sidecar read per ingest).
+          3. Escalate: 300dpi render → same rotation → cache-aware OCR with
+             scores (``_ocr_with_scores``, the ssRT probe path — N=2 reuse).
+             Engine failure keeps the base text and caches nothing, so a
+             transient failure retries next run (rotation-probe stance).
+          4. Pick the higher ``ocr_mass`` (the established frame-quality
+             scalar from ssRT); ties keep base — the standard frame stays
+             canonical unless the hi-dpi read is strictly better. Decision +
+             both evidence rows persist in the .rescue sidecar
+             (``escalated`` / ``chosen``). [DECISION-pl.40]
+        """
+        cache_key = hashlib.sha256(base_jpeg).hexdigest()
+        rescue_path = self._rescue_path(cache_key)
+
+        # Step 1 — cached decision: replay it without any gating or engine.
+        if rescue_path.exists():
+            decision: dict[str, Any] = json.loads(rescue_path.read_text(encoding="utf-8"))
+            if decision["chosen"] != "escalated":
+                return base_text
+            escalated_jpeg = self._escalated_frame(page, rotation)
+            return self._ocr_jpeg(escalated_jpeg, page_num, pdf_name)
+
+        # Step 2 — gate from the standard frame's metrics sidecar.
+        metrics_path = self._metrics_path(cache_key)
+        if not metrics_path.exists():
+            logger.info(
+                "rapidocr_parser.rescue_skipped_no_metrics",
+                pdf=pdf_name,
+                page=page_num,
+                cache_key=cache_key[:12],
+            )
+            return base_text
+        metrics: dict[str, Any] = json.loads(metrics_path.read_text(encoding="utf-8"))
+        base_scores = [float(s) for s in metrics.get("scores", [])]
+        min_score = min(base_scores) if base_scores else None
+        # Zero-box frames (min_score undefined) gate THROUGH — no score
+        # evidence means no proof the standard frame is readable (same
+        # stance as the rotation probe gate, DECISION-pl.11).
+        if min_score is not None and min_score >= self._rescue_min_score:
+            return base_text
+
+        # Step 3 — escalated pass on the upright RESCUE_DPI frame.
+        escalated_jpeg = self._escalated_frame(page, rotation)
+        rescued = self._ocr_with_scores(escalated_jpeg, page_num, pdf_name)
+        if rescued is None:
+            # Transient engine failure: keep base, cache nothing → retry
+            # on the next run (a frozen wrong decision would be forever).
+            logger.warning(
+                "rapidocr_parser.rescue_ocr_error",
+                pdf=pdf_name,
+                page=page_num,
+            )
+            return base_text
+        rescue_text, rescue_scores = rescued
+
+        # Step 4 — rank by ocr_mass; strict > keeps base on a dead heat.
+        base_mass = ocr_mass(base_text, base_scores)
+        rescue_mass = ocr_mass(rescue_text, rescue_scores)
+        chosen = "escalated" if rescue_mass > base_mass else "base"
+        rescue_path.write_text(
+            json.dumps(
+                {
+                    "escalated": True,
+                    "chosen": chosen,
+                    "rescue_dpi": RESCUE_DPI,
+                    "rotation": rotation,
+                    "gate_signal": "min_score",
+                    "gate_threshold": self._rescue_min_score,
+                    "base": _probe_record(base_text, base_scores),
+                    "rescue": _probe_record(rescue_text, rescue_scores),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        logger.info(
+            "rapidocr_parser.rescue_decided",
+            pdf=pdf_name,
+            page=page_num,
+            chosen=chosen,
+            base_mass=round(base_mass, 1),
+            rescue_mass=round(rescue_mass, 1),
+            cache_key=cache_key[:12],
+        )
+        return rescue_text if chosen == "escalated" else base_text
 
     def _assembled_text(self, result: Any, jpeg_bytes: bytes) -> str:
         """Reading-order text for one engine result, per the assembly mode.

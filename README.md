@@ -154,6 +154,30 @@ uv run jcontract ocr-quality scan.pdf --flag-above n_columns:1 --flag-above max_
 uv run jcontract ingest scan.pdf --parser rapidocr --assembly regions
 ```
 
+#### DPI-escalation rescue (`--dpi-rescue`, rapidocr only, opt-in)
+
+Some pages OCR poorly at the standard 150dpi simply because the glyphs are too small
+(italic species names, fine print, dense footnotes). With `--dpi-rescue` (off by
+default — zero behaviour change), a page whose OCR is still low quality after the
+optional auto-rotate fix (per-box `min_score < 0.756` or zero boxes — the same "low
+quality" signal as the rotation gate) is re-rendered at 300dpi on the upright frame and
+re-read; the result with the higher OCR mass (chars × mean confidence) wins. Exactly one
+150→300 step — no dpi ladder. The decision (plus both evidence rows) is cached in a
+`*.rescue.json` sidecar keyed by the standard frame's hash, so re-ingest never re-pays
+the hi-dpi pass; the 300dpi frame's OCR lands in its own content-addressed cache entry.
+A "rescue lost" sidecar is itself useful evidence: the page resists local OCR at any
+resolution and is a candidate for cloud/manual handling.
+
+The triage gallery gets the human-facing half: `ocr-gallery --dpi 300` exports
+higher-resolution page images for zooming, while `pNNNN.txt` deliberately keeps coming
+from the standard 150dpi cache-key frame — the gallery image is for people; the text
+shows what the machine actually read.
+
+```bash
+uv run jcontract ingest scan.pdf --parser rapidocr --auto-rotate --dpi-rescue
+uv run jcontract ocr-gallery scan.pdf --out triage/ --flag-below min_score:0.756 --dpi 300
+```
+
 #### Needs-vision classifier v2 (`JCONTRACT_PAGE_CLASSIFY=v2`, rapidocr only, opt-in)
 
 The text-vs-drawing verdict (`page_kind`) gates the drawing/caption lane. The default

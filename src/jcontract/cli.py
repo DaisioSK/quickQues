@@ -250,6 +250,7 @@ def _build_parser(
     profile: DomainProfile | None = None,
     auto_rotate: bool = False,
     assembly: str = "default",
+    dpi_rescue: bool = False,
 ) -> PDFParser:
     """Select the PDFParser impl by name. Lazy imports keep heavy deps
     (anthropic / openai SDKs, pypdfium2 / sentence-transformers) out of
@@ -284,11 +285,19 @@ def _build_parser(
     side-by-side layouts, own cache namespace). rapidocr-only for the same
     reason as auto_rotate: the LLM vendors assemble reading order inside
     the model.
+
+    ssHD: ``dpi_rescue`` enables the rapidocr DPI-escalation rescue (pages
+    still low-quality after the standard 150dpi pass get a 300dpi re-render
+    + re-read; the better result wins, decision sidecar-cached).
+    rapidocr-only: only this vendor exposes the per-box scores the gate and
+    the quality comparison need. [DECISION-pl.40]
     """
     if auto_rotate and name != "rapidocr":
         raise typer.BadParameter("--auto-rotate is only supported by --parser rapidocr")
     if assembly != "default" and name != "rapidocr":
         raise typer.BadParameter("--assembly is only supported by --parser rapidocr")
+    if dpi_rescue and name != "rapidocr":
+        raise typer.BadParameter("--dpi-rescue is only supported by --parser rapidocr")
     if name == "pypdf":
         return PyPdfParser()
     if name == "claude-vision":
@@ -318,7 +327,12 @@ def _build_parser(
         # An unknown assembly mode raises ValueError in the constructor —
         # surface it as the CLI usage error it is.
         try:
-            return RapidOcrParser(max_pages=max_pages, auto_rotate=auto_rotate, assembly=assembly)
+            return RapidOcrParser(
+                max_pages=max_pages,
+                auto_rotate=auto_rotate,
+                assembly=assembly,
+                dpi_rescue=dpi_rescue,
+            )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from None
     raise typer.BadParameter(
@@ -412,6 +426,19 @@ def ingest(
             ),
         ),
     ] = "default",
+    dpi_rescue: Annotated[
+        bool,
+        typer.Option(
+            "--dpi-rescue/--no-dpi-rescue",
+            help=(
+                "rapidocr only (ssHD): pages still low-quality after the "
+                "standard 150dpi pass (min_score < 0.756 or zero boxes) get "
+                "a 300dpi re-render + re-read; the better result wins. "
+                "Decisions are sidecar-cached so re-ingest never re-pays "
+                "the rescue. Off = pre-ssHD behaviour."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Parse, chunk, embed, and index one PDF into Qdrant + BM25 + RefGraph."""
     # Phase 7: the DomainProfile drives prompts + chunking structure, and is
@@ -441,6 +468,7 @@ def ingest(
                 profile=profile,
                 auto_rotate=auto_rotate,
                 assembly=assembly,
+                dpi_rescue=dpi_rescue,
             ),
             chunker=QaAwareChunker(profile.structure),
             embedder=stack.embedder,
@@ -1291,12 +1319,24 @@ def ocr_gallery(
             ),
         ),
     ] = "default",
+    dpi: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "Render DPI for the exported pNNNN.jpg images only (ssHD). "
+                "Default 150 = byte-identical to pre-ssHD galleries. The "
+                "OCR text path is untouched: pNNNN.txt always comes from "
+                "the standard 150dpi cache-key frame."
+            ),
+        ),
+    ] = 150,
 ) -> None:
     """Export low-quality OCR pages as a human-triage gallery (ssTG).
 
-    For every flagged page: the rendered page image (`pNNNN.jpg`, same
-    150dpi/q85 geometry as the OCR cache key, so the OCR text is a cache
-    hit whenever the page was OCR'd before), the OCR plain text
+    For every flagged page: the rendered page image (`pNNNN.jpg`, default
+    150dpi/q85 = the OCR cache-key geometry; `--dpi 300` exports a
+    higher-resolution image for human zooming without touching the OCR
+    text path, DECISION-pl.41), the OCR plain text
     (`pNNNN.txt`, full, untruncated), and one `index.md` row — worst page
     first — so a maintainer can eyeball WHY pages score low before any
     routing rule is written (manual triage first, DECISION-tt.3).
@@ -1378,7 +1418,20 @@ def ocr_gallery(
         jpeg_bytes = render_pdf_page_jpeg(
             pdf_path, page_num, dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
         )
-        (out / f"p{page_num:04d}.jpg").write_bytes(jpeg_bytes)
+        # ssHD: --dpi affects ONLY the exported image — the artifact a human
+        # zooms into. OCR text deliberately keeps coming from the standard
+        # 150dpi frame above (the cache-key geometry): a hi-dpi gallery must
+        # show the text the INDEX actually holds, not silently fork/re-run
+        # OCR in a hi-dpi namespace. Gallery image = for people; .txt = what
+        # the machine read. [DECISION-pl.41]
+        export_bytes = (
+            jpeg_bytes
+            if dpi == DEFAULT_DPI
+            else render_pdf_page_jpeg(
+                pdf_path, page_num, dpi=dpi, jpeg_quality=DEFAULT_JPEG_QUALITY
+            )
+        )
+        (out / f"p{page_num:04d}.jpg").write_bytes(export_bytes)
         text = parser.ocr_text_for_jpeg(jpeg_bytes, page_num, pdf_path.name)
         # Full text in the .txt (triage needs everything the engine saw);
         # truncation happens only in the index preview. [DECISION-tt.12]

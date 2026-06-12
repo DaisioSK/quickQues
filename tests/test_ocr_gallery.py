@@ -418,3 +418,103 @@ def test_non_numeric_threshold_is_usage_error(tmp_path):
         ],
     )
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# ssHD --dpi: hi-res exported image, OCR text stays on the standard frame
+# ---------------------------------------------------------------------------
+
+
+def test_dpi_option_exports_hires_image_but_standard_text(tmp_path, monkeypatch):
+    """--dpi 300 changes ONLY the exported jpg; the .txt must come from the
+    standard 150dpi cache-key frame (the engine never sees hi-dpi bytes).
+    [DECISION-pl.41]"""
+    monkeypatch.chdir(tmp_path)
+
+    def fake_render_pdf_page_jpeg(
+        pdf_path: Path, page_num: int, *, dpi: int, jpeg_quality: int
+    ) -> bytes:
+        assert jpeg_quality == 85
+        return f"FAKEJPEG-{page_num}-{dpi}".encode()
+
+    def fake_engine(jpeg_bytes: bytes) -> types.SimpleNamespace:
+        # The OCR path must only ever receive the 150dpi standard frame.
+        assert jpeg_bytes.endswith(b"-150"), jpeg_bytes
+        return types.SimpleNamespace(
+            boxes=[_box(10, 10, 100, 40)], txts=("standard frame text",), scores=(0.5,)
+        )
+
+    monkeypatch.setattr(
+        "jcontract.impls._pdfium_render.render_pdf_page_jpeg", fake_render_pdf_page_jpeg
+    )
+    engine = MagicMock(side_effect=fake_engine)
+    monkeypatch.setattr(RapidOcrParser, "_ensure_engine", lambda self: engine)
+
+    quality = tmp_path / "report.jsonl"
+    _write_quality_jsonl(quality, [_quality_record(1, 0.9), _quality_record(2, 0.4)])
+    out = tmp_path / "gallery"
+
+    result = runner.invoke(
+        app,
+        [
+            "ocr-gallery",
+            str(SYNTHETIC_PDF),
+            "--quality",
+            str(quality),
+            "--flag-below",
+            "min_score:0.756",
+            "--out",
+            str(out),
+            "--dpi",
+            "300",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    # Image = the hi-dpi render; text = OCR of the standard frame.
+    assert (out / "p0002.jpg").read_bytes() == b"FAKEJPEG-2-300"
+    assert (out / "p0002.txt").read_text(encoding="utf-8") == "standard frame text"
+    assert engine.call_count == 1
+
+
+def test_default_dpi_renders_each_page_once(tmp_path, monkeypatch):
+    """Without --dpi the export is byte-identical to pre-ssHD behaviour and
+    the page is rendered exactly once (no redundant second render)."""
+    monkeypatch.chdir(tmp_path)
+    render_calls: list[tuple[int, int]] = []
+
+    def fake_render_pdf_page_jpeg(
+        pdf_path: Path, page_num: int, *, dpi: int, jpeg_quality: int
+    ) -> bytes:
+        render_calls.append((page_num, dpi))
+        return f"FAKEJPEG-{page_num}-{dpi}".encode()
+
+    def fake_engine(jpeg_bytes: bytes) -> types.SimpleNamespace:
+        return types.SimpleNamespace(boxes=[_box(10, 10, 100, 40)], txts=("text",), scores=(0.5,))
+
+    monkeypatch.setattr(
+        "jcontract.impls._pdfium_render.render_pdf_page_jpeg", fake_render_pdf_page_jpeg
+    )
+    engine = MagicMock(side_effect=fake_engine)
+    monkeypatch.setattr(RapidOcrParser, "_ensure_engine", lambda self: engine)
+
+    quality = tmp_path / "report.jsonl"
+    _write_quality_jsonl(quality, [_quality_record(1, 0.4)])
+    out = tmp_path / "gallery"
+
+    result = runner.invoke(
+        app,
+        [
+            "ocr-gallery",
+            str(SYNTHETIC_PDF),
+            "--quality",
+            str(quality),
+            "--flag-below",
+            "min_score:0.756",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (out / "p0001.jpg").read_bytes() == b"FAKEJPEG-1-150"
+    assert render_calls == [(1, 150)]

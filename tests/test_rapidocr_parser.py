@@ -402,3 +402,261 @@ def test_regions_second_parse_is_pure_cache_hit(tmp_path):
 def test_unknown_assembly_mode_raises():
     with pytest.raises(ValueError, match="assembly"):
         RapidOcrParser(assembly="diagonal")
+
+
+# ---------------------------------------------------------------------------
+# ssHD dpi-escalation rescue: opt-in gate, take-the-better, rescue sidecar
+# ---------------------------------------------------------------------------
+
+
+def _page1_rescue_frames(rotation: int = 0) -> tuple[bytes, bytes]:
+    """(standard 150dpi frame, escalated RESCUE_DPI frame) for fixture page 1.
+
+    Both frames go through the same deterministic render (+ optional
+    rotate_jpeg) the parser uses internally, so keying the fake engine by
+    these bytes pins the real escalation path end to end.
+    """
+    from jcontract.impls._page_orient import rotate_jpeg
+    from jcontract.impls._pdfium_render import render_pdf_page_jpeg
+    from jcontract.impls.rapidocr_parser import DEFAULT_DPI, DEFAULT_JPEG_QUALITY, RESCUE_DPI
+
+    base = render_pdf_page_jpeg(
+        SYNTHETIC_PDF, 1, dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
+    )
+    hi = render_pdf_page_jpeg(SYNTHETIC_PDF, 1, dpi=RESCUE_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY)
+    if rotation:
+        base = rotate_jpeg(base, rotation, jpeg_quality=DEFAULT_JPEG_QUALITY)
+        hi = rotate_jpeg(hi, rotation, jpeg_quality=DEFAULT_JPEG_QUALITY)
+    return base, hi
+
+
+def test_default_parse_never_rescues(tmp_path):
+    """dpi_rescue off (default): a low-quality page changes NOTHING — one
+    engine run, no .rescue sidecar, no 300dpi render (zero behaviour change)."""
+    cache_dir = tmp_path / "cache"
+    base, _hi = _page1_rescue_frames()
+    engine = _frame_keyed_engine(
+        {base: _scored_result([_box(10, 10, 100, 40)], ("low quality",), (0.50,))}
+    )
+    pages = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1).parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "low quality"
+    assert engine.call_count == 1  # a hi-dpi frame would KeyError the table
+    assert list(cache_dir.glob("*.rescue*.json")) == []
+
+
+def test_dpi_rescue_healthy_page_skips_escalation(tmp_path):
+    """Gate-passing page (min_score >= threshold): no hi-dpi render/OCR and
+    no sidecar — the gate re-check is a cheap metrics read per ingest."""
+    cache_dir = tmp_path / "cache"
+    base, _hi = _page1_rescue_frames()
+    engine = _frame_keyed_engine(
+        {base: _scored_result([_box(10, 10, 100, 40)], ("healthy text",), (0.99,))}
+    )
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, dpi_rescue=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "healthy text"
+    assert engine.call_count == 1
+    assert list(cache_dir.glob("*.rescue*.json")) == []
+
+
+def test_dpi_rescue_escalates_and_picks_better(tmp_path):
+    """Gated page where 300dpi reads strictly better: the escalated text wins
+    and the sidecar records the decision plus both evidence rows."""
+    cache_dir = tmp_path / "cache"
+    base, hi = _page1_rescue_frames()
+    engine = _frame_keyed_engine(
+        {
+            # 150dpi: short text, one box under the 0.756 gate.
+            base: _scored_result(
+                [_box(10, 10, 100, 40), _box(10, 60, 100, 90)], ("tiny", "blur"), (0.95, 0.50)
+            ),
+            # 300dpi: long confident text — higher ocr_mass, clear win.
+            hi: _scored_result(
+                [_box(20, 20, 800, 80)],
+                ("the italic species names are now readable",),
+                (0.98,),
+            ),
+        }
+    )
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, dpi_rescue=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "the italic species names are now readable"
+    assert engine.call_count == 2  # standard pass + one escalated pass
+    sidecars = list(cache_dir.glob("rapidocr-*.rescue.json"))
+    assert len(sidecars) == 1
+    decision = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert decision["escalated"] is True
+    assert decision["chosen"] == "escalated"
+    assert decision["rescue_dpi"] == 300
+    assert decision["rotation"] == 0
+    assert decision["rescue"]["mass"] > decision["base"]["mass"]
+    # The escalated frame's OCR landed in its OWN content-addressed entry:
+    # base + escalated .txt files coexist in the default namespace.
+    assert len(list(cache_dir.glob("rapidocr-*.text.txt"))) == 2
+
+
+def test_dpi_rescue_keeps_base_when_no_better(tmp_path):
+    """Gated page where 300dpi does NOT improve: base text is kept and the
+    sidecar records the lost rescue (the 'route to cloud/manual' evidence)."""
+    cache_dir = tmp_path / "cache"
+    base, hi = _page1_rescue_frames()
+    engine = _frame_keyed_engine(
+        {
+            base: _scored_result([_box(10, 10, 200, 40)], ("low quality text",), (0.60,)),
+            hi: _scored_result([_box(10, 10, 50, 40)], ("junk",), (0.50,)),
+        }
+    )
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, dpi_rescue=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "low quality text"
+    assert engine.call_count == 2
+    sidecars = list(cache_dir.glob("rapidocr-*.rescue.json"))
+    assert len(sidecars) == 1
+    decision = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert decision["escalated"] is True
+    assert decision["chosen"] == "base"
+
+
+def test_dpi_rescue_second_parse_replays_cached_decision(tmp_path):
+    """Re-ingest must not re-pay the rescue: sidecar + the winning frame's
+    text cache make the second parse engine-free with the identical text."""
+    cache_dir = tmp_path / "cache"
+    base, hi = _page1_rescue_frames()
+    table = {
+        base: _scored_result([_box(10, 10, 100, 40)], ("blur",), (0.50,)),
+        hi: _scored_result([_box(20, 20, 800, 80)], ("rescued readable line",), (0.98,)),
+    }
+    first = RapidOcrParser(
+        cache_dir=cache_dir, engine=_frame_keyed_engine(table), max_pages=1, dpi_rescue=True
+    ).parse(SYNTHETIC_PDF)
+
+    engine_2 = MagicMock(side_effect=AssertionError("second parse must not OCR"))
+    second = RapidOcrParser(
+        cache_dir=cache_dir, engine=engine_2, max_pages=1, dpi_rescue=True
+    ).parse(SYNTHETIC_PDF)
+
+    assert engine_2.call_count == 0
+    assert second[0].text == first[0].text == "rescued readable line"
+
+
+def test_dpi_rescue_zero_box_page_gates_through(tmp_path):
+    """A zero-box standard frame has NO score evidence — it gates through
+    (ssRT stance) and a text-bearing 300dpi read wins by mass > 0."""
+    cache_dir = tmp_path / "cache"
+    base, hi = _page1_rescue_frames()
+    engine = _frame_keyed_engine(
+        {
+            base: _make_result(None, None),  # blank: txts=None/boxes=None
+            hi: _scored_result([_box(20, 20, 800, 80)], ("faint print recovered",), (0.97,)),
+        }
+    )
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, dpi_rescue=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "faint print recovered"
+    decision = json.loads(
+        next(iter(cache_dir.glob("rapidocr-*.rescue.json"))).read_text(encoding="utf-8")
+    )
+    assert decision["chosen"] == "escalated"
+    assert decision["base"]["boxes"] == 0
+
+
+def test_dpi_rescue_skips_without_metrics_sidecar(tmp_path):
+    """Pre-ssQA cache hit (.txt without metrics): rescue SKIPS — backfilling
+    would force an engine run inside ingest (DECISION-cq.21 forbids)."""
+    cache_dir = tmp_path / "cache"
+    base, _hi = _page1_rescue_frames()
+    RapidOcrParser(
+        cache_dir=cache_dir,
+        engine=_frame_keyed_engine(
+            {base: _scored_result([_box(10, 10, 100, 40)], ("old cached text",), (0.50,))}
+        ),
+        max_pages=1,
+    ).parse(SYNTHETIC_PDF)
+    for sidecar in cache_dir.glob("rapidocr-*.metrics.json"):
+        sidecar.unlink()
+
+    engine_2 = MagicMock(side_effect=AssertionError("skip path must not OCR"))
+    pages = RapidOcrParser(
+        cache_dir=cache_dir, engine=engine_2, max_pages=1, dpi_rescue=True
+    ).parse(SYNTHETIC_PDF)
+
+    assert engine_2.call_count == 0
+    assert pages[0].text == "old cached text"
+    assert list(cache_dir.glob("*.rescue*.json")) == []
+
+
+def test_dpi_rescue_engine_error_keeps_base_and_does_not_cache(tmp_path):
+    """Transient failure on the escalated pass: keep the base text, write NO
+    sidecar — the next run retries instead of freezing a failed verdict."""
+    cache_dir = tmp_path / "cache"
+    base, hi = _page1_rescue_frames()
+
+    def engine_fn(jpeg_bytes: bytes) -> types.SimpleNamespace:
+        if jpeg_bytes == hi:
+            raise RuntimeError("simulated engine failure")
+        return _scored_result([_box(10, 10, 100, 40)], ("base survives",), (0.50,))
+
+    engine = MagicMock(side_effect=engine_fn)
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, dpi_rescue=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].text == "base survives"
+    assert list(cache_dir.glob("*.rescue*.json")) == []
+
+
+def test_dpi_rescue_after_rotation_escalates_upright_frame(tmp_path):
+    """auto_rotate + dpi_rescue compose: the 300dpi render is rotated by the
+    ALREADY-DECIDED rotation before OCR (escalating a sideways frame would
+    be wasted), and the final text comes from the upright hi-dpi frame."""
+    cache_dir = tmp_path / "cache"
+    frames = _page1_frames()
+    _base90, hi90 = _page1_rescue_frames(rotation=90)
+    engine = _frame_keyed_engine(
+        {
+            # rotation 0: gated (min 0.60) + low mass.
+            frames[0]: _scored_result([_box(10, 10, 100, 40)], ("frag",), (0.60,)),
+            # rotation 90: probe winner, but STILL under the rescue gate.
+            frames[90]: _scored_result(
+                [_box(10, 10, 400, 40)], ("sideways text recovered",), (0.70,)
+            ),
+            frames[180]: _scored_result([_box(10, 10, 50, 40)], ("j",), (0.50,)),
+            frames[270]: _scored_result([_box(10, 10, 50, 40)], ("j",), (0.50,)),
+            # upright 300dpi frame: the rescue target — confident long read.
+            hi90: _scored_result(
+                [_box(20, 20, 900, 80)], ("hi dpi upright fully readable line",), (0.99,)
+            ),
+        }
+    )
+    parser = RapidOcrParser(
+        cache_dir=cache_dir, engine=engine, max_pages=1, auto_rotate=True, dpi_rescue=True
+    )
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].rotation == 90
+    assert pages[0].text == "hi dpi upright fully readable line"
+    decision = json.loads(
+        next(iter(cache_dir.glob("rapidocr-*.rescue.json"))).read_text(encoding="utf-8")
+    )
+    assert decision["chosen"] == "escalated"
+    assert decision["rotation"] == 90
+
+
+def test_build_parser_rejects_dpi_rescue_for_non_rapidocr():
+    """--dpi-rescue must fail loudly for parsers without per-box scores."""
+    import typer
+
+    from jcontract.cli import _build_parser
+
+    with pytest.raises(typer.BadParameter, match="dpi-rescue"):
+        _build_parser("pypdf", None, dpi_rescue=True)
