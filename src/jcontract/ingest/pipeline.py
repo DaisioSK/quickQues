@@ -19,6 +19,7 @@ from jcontract.interfaces import (
     Chunker,
     Embedder,
     KeywordIndex,
+    ParsedPage,
     PDFParser,
     RefGraph,
     VectorStore,
@@ -94,7 +95,7 @@ class IngestPipeline:
         # never raise per Protocol contract; they yield empty captions
         # which we record as "" (distinguishable from None = never ran).
         if self.captioner is not None:
-            self._attach_captions(chunks, pdf_path)
+            self._attach_captions(chunks, pdf_path, pages)
 
         # Embed all chunks in one batch — Embedder impls handle batching
         # internally. chunk_indexable_text folds caption into the text
@@ -122,7 +123,9 @@ class IngestPipeline:
 
         return len(chunks)
 
-    def _attach_captions(self, chunks: list[Chunk], pdf_path: Path) -> None:
+    def _attach_captions(
+        self, chunks: list[Chunk], pdf_path: Path, pages: list[ParsedPage]
+    ) -> None:
         """Mutate drawing-type chunks to add a Chinese caption.
 
         Implementation choices:
@@ -137,8 +140,21 @@ class IngestPipeline:
           - Captioner errors are silent per Protocol contract; we still
             set chunk.caption = "" so the snapshot/state distinguishes
             "ran but empty" from "never ran" (None).
+          - ssRT: when the parser corrected a page's orientation
+            (``ParsedPage.rotation`` != 0), the caption render is rotated
+            the same way before it reaches the VLM — the model must see
+            the upright frame the OCR text came from, not the sideways
+            original. Pages without a rotation (the default 0) keep the
+            exact pre-ssRT bytes. [DECISION-pl.13]
         """
+        # Local imports keep pypdfium2/PIL out of the top-level pipeline
+        # imports for users who don't enable the captioner.
+        from jcontract.impls._page_orient import rotate_jpeg
         from jcontract.impls.claude_vision_captioner import render_page_to_jpeg
+
+        # page_num -> non-zero rotation, from the parser's ParsedPage list.
+        # Empty for every parser that doesn't auto-rotate (default path).
+        page_rotations = {p.page_num: p.rotation for p in pages if p.rotation}
 
         # Per-page render cache scoped to this ingest call only.
         page_image_cache: dict[int, bytes] = {}
@@ -148,7 +164,11 @@ class IngestPipeline:
                 continue
             drawing_count += 1
             if chunk.page not in page_image_cache:
-                page_image_cache[chunk.page] = render_page_to_jpeg(pdf_path, chunk.page)
+                rendered = render_page_to_jpeg(pdf_path, chunk.page)
+                rotation = page_rotations.get(chunk.page, 0)
+                if rotation:
+                    rendered = rotate_jpeg(rendered, rotation)
+                page_image_cache[chunk.page] = rendered
             image_bytes = page_image_cache[chunk.page]
             # Captioner returns DrawingCaption; we only need caption_zh
             # for the chunk field. entities is left as a FORESHADOW —

@@ -258,6 +258,81 @@ def test_pipeline_without_captioner_leaves_drawing_caption_none(tmp_path: Path) 
 
 
 # --------------------------------------------------------------------------- #
+# ssRT: caption lane rotates the page render for rotation-corrected pages
+# --------------------------------------------------------------------------- #
+
+
+class _CapturingCaptioner:
+    def __init__(self) -> None:
+        self.seen_images: list[bytes] = []
+
+    def caption(self, image_bytes: bytes, ocr_text: str) -> DrawingCaption:
+        self.seen_images.append(image_bytes)
+        return DrawingCaption(caption_zh="规格图", entities=[])
+
+
+def _tiny_jpeg() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("L", (8, 20), color=128).save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _caption_pipeline(
+    tmp_path: Path, pages: list[ParsedPage], captioner: _CapturingCaptioner
+) -> IngestPipeline:
+    return IngestPipeline(
+        parser=_FakeParser(pages),
+        chunker=QaAwareChunker(),
+        embedder=_FakeEmbedder(),
+        vector_store=_FakeVectorStore(),
+        keyword_index=_FakeKeywordIndex(),
+        chunks_snapshot_path=tmp_path / "chunks_snapshot.jsonl",
+        captioner=captioner,
+    )
+
+
+def test_attach_captions_rotates_render_for_corrected_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page the parser auto-rotated (ParsedPage.rotation=90) must reach the
+    VLM as the SAME upright frame the OCR text came from — i.e. the caption
+    render is transformed via the shared rotate_jpeg before captioning."""
+    from jcontract.impls._page_orient import rotate_jpeg
+
+    rendered = _tiny_jpeg()
+    pages = [ParsedPage(page_num=1, text="sideways drawing", page_kind="drawing", rotation=90)]
+    captioner = _CapturingCaptioner()
+    monkeypatch.setattr(
+        "jcontract.impls.claude_vision_captioner.render_page_to_jpeg",
+        lambda pdf_path, page_num: rendered,
+    )
+    _caption_pipeline(tmp_path, pages, captioner).ingest(SYNTHETIC_PDF)
+
+    assert captioner.seen_images == [rotate_jpeg(rendered, 90)]
+
+
+def test_attach_captions_unrotated_page_keeps_exact_render_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rotation=0 (every pre-ssRT page): the captioner sees the render
+    bytes UNTOUCHED — no decode/re-encode drift in the default path."""
+    rendered = _tiny_jpeg()
+    pages = [ParsedPage(page_num=1, text="upright drawing", page_kind="drawing")]
+    captioner = _CapturingCaptioner()
+    monkeypatch.setattr(
+        "jcontract.impls.claude_vision_captioner.render_page_to_jpeg",
+        lambda pdf_path, page_num: rendered,
+    )
+    _caption_pipeline(tmp_path, pages, captioner).ingest(SYNTHETIC_PDF)
+
+    assert captioner.seen_images == [rendered]
+
+
+# --------------------------------------------------------------------------- #
 # Parsers surface page_kind
 # --------------------------------------------------------------------------- #
 

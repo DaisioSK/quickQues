@@ -194,6 +194,13 @@ def test_render_elements_empty_has_meta_only():
     assert len(lines) == 1
 
 
+def test_render_elements_records_applied_rotation():
+    """ssRT: a caller that structured an auto-rotated frame records the
+    correction in the meta line (geometry is relative to that frame)."""
+    lines = render_elements([_cell(0, 0, "x")], rotation=90).splitlines()
+    assert json.loads(lines[0]) == {"rotation": 90, "cells": 1}
+
+
 # ---------------------------------------------------------------------------
 # structure_table — engine orchestration + failure semantics
 # ---------------------------------------------------------------------------

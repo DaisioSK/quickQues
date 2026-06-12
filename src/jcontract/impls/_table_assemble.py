@@ -40,9 +40,11 @@ from PIL import Image
 
 logger = structlog.get_logger(__name__)
 
-# Page-level rotation metadata for the elements view. Rotation detection is
-# an upstream, separate mechanism (DECISION-tt.23) — this sub-sprint never
-# rotates, so the recorded frame is always the rendered frame as-is.
+# Default page-level rotation metadata for the elements view. Rotation
+# detection is an upstream, separate mechanism (DECISION-tt.23, delivered
+# by ssRT's _page_orient probe) — callers that rotated the frame before
+# structuring pass the applied rotation to render_elements; everything
+# else keeps the as-rendered frame and this 0 default.
 ROTATION = 0
 
 # Normalized coordinates are rounded to 4 decimal places — at 150 DPI / A4
@@ -330,16 +332,18 @@ def _escape_md_cell(text: str) -> str:
     return text.replace("|", "\\|")
 
 
-def render_elements(cells: Sequence[TableCell]) -> str:
+def render_elements(cells: Sequence[TableCell], *, rotation: int = ROTATION) -> str:
     """Cell list → JSONL elements view (pure, deterministic).
 
-    Line 1 is the page-level metadata record (rotation per DECISION-tt.23 —
-    always 0 in this sub-sprint — plus the cell count); every following
-    line is one TableCell in dataclass field order. JSONL so downstream
-    consumers (citation highlighting, FORESHADOW-tt.1 chunker wiring) can
-    stream it without a parser dependency.
+    Line 1 is the page-level metadata record (rotation per DECISION-tt.23:
+    the orientation correction the caller applied to the frame BEFORE
+    structuring — cell geometry is normalized to that corrected frame —
+    0 when the frame was used as rendered; plus the cell count); every
+    following line is one TableCell in dataclass field order. JSONL so
+    downstream consumers (citation highlighting, FORESHADOW-tt.1 chunker
+    wiring) can stream it without a parser dependency.
     """
-    meta = {"rotation": ROTATION, "cells": len(cells)}
+    meta = {"rotation": rotation, "cells": len(cells)}
     lines = [json.dumps(meta, ensure_ascii=False)]
     lines += [json.dumps(asdict(cell), ensure_ascii=False) for cell in cells]
     return "\n".join(lines)

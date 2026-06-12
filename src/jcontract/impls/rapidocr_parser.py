@@ -60,6 +60,7 @@ import structlog
 
 from jcontract.impls._ocr_cache_key import model_cache_suffix
 from jcontract.impls._page_classify import _classify_page
+from jcontract.impls._page_orient import probe_rotation, rotate_jpeg
 from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.interfaces import PageKind, ParsedPage
 
@@ -207,6 +208,7 @@ class RapidOcrParser:
         max_pages: int | None = None,
         engine: Callable[[bytes], Any] | None = None,
         auto_classify: bool = True,
+        auto_rotate: bool = False,
     ) -> None:
         # Tests inject a fake ``engine`` callable; production lazily builds
         # the real RapidOCR pipeline on first use (_ensure_engine) so that
@@ -224,6 +226,14 @@ class RapidOcrParser:
         # does NOT touch the cache key — it only sets ParsedPage.page_kind.
         # auto_classify=False forces "text" for every page (eval baselines).
         self._auto_classify = auto_classify
+        # ssRT: opt-in orientation probe. When True, pages whose rotation-0
+        # frame is low quality (min_score < GATE_MIN_SCORE, DECISION-pl.11)
+        # get the four-direction OCR-mass comparison; the winning rotation
+        # is cached in a sidecar keyed by the ORIGINAL frame's sha256 and
+        # the upright frame feeds the normal OCR path (its own sha256 = its
+        # own cache key — zero collision with the original namespace).
+        # Default False = zero behaviour change for every existing caller.
+        self._auto_rotate = auto_rotate
         # RapidOCR's pipeline mutates per-call internal buffers; nothing in
         # the codebase calls this vendor concurrently today (batch-ingest
         # only wires the network vendors), but the lock makes _ocr_jpeg
@@ -301,11 +311,25 @@ class RapidOcrParser:
         heuristic; the verdict is recorded on ``ParsedPage.page_kind`` so
         the chunker can emit drawing chunks for the --caption lane. OCR
         text and cache layout are completely unaffected by the verdict.
+
+        ssRT: with ``auto_rotate`` on, the orientation decision happens
+        FIRST and everything downstream — OCR, classification, the
+        ParsedPage — sees the upright frame; the chosen rotation rides
+        along on ``ParsedPage.rotation`` so the caption lane can rotate
+        its own render the same way.
         """
         jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
+        rotation = 0
+        if self._auto_rotate:
+            rotation = self.resolve_rotation(jpeg_bytes, page_num, pdf_name)
+            if rotation:
+                jpeg_bytes = rotate_jpeg(jpeg_bytes, rotation, jpeg_quality=self._jpeg_quality)
         text = self._ocr_jpeg(jpeg_bytes, page_num, pdf_name)
         return ParsedPage(
-            page_num=page_num, text=text, page_kind=self._page_kind(jpeg_bytes, page_num, pdf_name)
+            page_num=page_num,
+            text=text,
+            page_kind=self._page_kind(jpeg_bytes, page_num, pdf_name),
+            rotation=rotation,
         )
 
     def _page_kind(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> PageKind:
@@ -354,6 +378,120 @@ class RapidOcrParser:
         own sidecar namespace exactly like its text does.
         """
         return self._cache_dir / f"{self.cache_prefix}-{cache_key}.metrics{self._model_suffix}.json"
+
+    def _rotation_path(self, cache_key: str) -> Path:
+        """Rotation-decision sidecar for these ORIGINAL frame bytes (ssRT).
+
+        `rapidocr-<sha256>.rotation[.<model>].json` — keyed by the
+        as-rendered frame's hash (the only stable identity the page has
+        before the decision exists). Model-suffixed like the .txt/.metrics
+        sidecars: the probe ranks ENGINE output, so a different model may
+        legitimately decide differently. [DECISION-pl.12]
+        """
+        return (
+            self._cache_dir / f"{self.cache_prefix}-{cache_key}.rotation{self._model_suffix}.json"
+        )
+
+    def resolve_rotation(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> int:
+        """Cached orientation decision for one rendered page (ssRT).
+
+        Sidecar-first: a stored decision is returned without any OCR (the
+        whole point — re-ingest must not re-pay the 4x probe). On a miss,
+        ``probe_rotation`` runs with the cache-aware OCR callable below, so
+        every probe's text + metrics land in the normal content-addressed
+        cache — including the winning upright frame, which makes the
+        subsequent ``_ocr_jpeg`` on it a pure cache hit (the page is never
+        OCR'd twice). The decision + full four-direction evidence is then
+        persisted, UNLESS a probe hit an engine error — transient failures
+        degrade to rotation 0 un-cached so the next run retries.
+        [DECISION-pl.12]
+
+        Public on purpose: ``table-preview --auto-rotate`` resolves its
+        page through this same entry point, sharing both the mechanism and
+        the sidecar cache with ingest.
+        """
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha256(jpeg_bytes).hexdigest()
+        rotation_path = self._rotation_path(cache_key)
+        if rotation_path.exists():
+            decision: dict[str, Any] = json.loads(rotation_path.read_text(encoding="utf-8"))
+            return int(decision["rotation"])
+
+        rotation, evidence = probe_rotation(
+            jpeg_bytes,
+            lambda frame: self._ocr_with_scores(frame, page_num, pdf_name),
+            jpeg_quality=self._jpeg_quality,
+        )
+        if evidence.get("engine_error"):
+            logger.warning(
+                "rapidocr_parser.rotation_probe_error",
+                pdf=pdf_name,
+                page=page_num,
+            )
+            return 0
+
+        rotation_path.write_text(
+            json.dumps({"rotation": rotation, **evidence}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(
+            "rapidocr_parser.rotation_decided",
+            pdf=pdf_name,
+            page=page_num,
+            rotation=rotation,
+            gated=evidence["gated"],
+            cache_key=cache_key[:12],
+        )
+        return rotation
+
+    def _ocr_with_scores(
+        self, jpeg_bytes: bytes, page_num: int, pdf_name: str
+    ) -> tuple[str, list[float]] | None:
+        """Cache-aware (text, scores) OCR for one frame — the probe's ocr_fn.
+
+        The probe needs scores (the .txt cache alone can't gate), so the
+        read path requires BOTH the .txt and the .metrics sidecar; anything
+        less force-runs the engine and backfills whichever artifact is
+        missing — exactly the ``quality_metrics`` backfill stance
+        (DECISION-cq.22: content-addressed output, never rewrite an
+        existing file). Engine failure returns None (probe aborts, decision
+        stays un-cached) instead of the ingest path's cached "" — caching a
+        text-less verdict here could freeze a wrong rotation forever.
+        """
+        cache_key = hashlib.sha256(jpeg_bytes).hexdigest()
+        text_path = self._text_cache_path(cache_key)
+        metrics_path = self._metrics_path(cache_key)
+        if text_path.exists() and metrics_path.exists():
+            metrics: dict[str, Any] = json.loads(metrics_path.read_text(encoding="utf-8"))
+            return (
+                text_path.read_text(encoding="utf-8"),
+                [float(s) for s in metrics["scores"]],
+            )
+
+        try:
+            engine = self._ensure_engine()
+            with self._engine_call_lock:
+                result = engine(jpeg_bytes)
+        except Exception as exc:  # noqa: BLE001 — probe failure must not abort the parse
+            logger.warning(
+                "rapidocr_parser.probe_ocr_error",
+                pdf=pdf_name,
+                page=page_num,
+                error_type=type(exc).__name__,
+            )
+            return None
+
+        if result.txts is None or result.boxes is None or len(result.txts) == 0:
+            text = ""
+        else:
+            text = _assemble_reading_order(result.boxes, result.txts)
+        scores = [] if result.scores is None else [float(s) for s in result.scores]
+
+        if not text_path.exists():
+            text_path.write_text(text, encoding="utf-8")
+        if not metrics_path.exists():
+            self._write_metrics_sidecar(cache_key, page_num, result, text)
+        return text, scores
 
     def _ocr_jpeg(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> str:
         """Cache-check + local OCR for pre-rendered JPEG bytes.

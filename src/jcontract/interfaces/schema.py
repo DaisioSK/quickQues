@@ -41,12 +41,22 @@ class ParsedPage:
     is the zero-behaviour-change guarantee for every pre-existing
     construction site (pypdf parser, tests, snapshots): a ParsedPage
     built without the field chunks exactly as before.
+
+    ``rotation`` (ssRT) is the orientation correction the parser applied
+    before OCR: degrees COUNTER-CLOCKWISE (0/90/180/270, PIL Transpose
+    semantics) that the page's standard 150dpi/q85 render must be rotated
+    to be upright. Downstream page-image consumers (caption lane today;
+    any future render-the-page-again site) MUST apply the same rotation —
+    via ``impls._page_orient.rotate_jpeg`` — before showing the page to a
+    model. Default 0 = same zero-behaviour-change guarantee as page_kind:
+    only the opt-in auto-rotate lane ever sets it. [DECISION-pl.13]
     """
 
     page_num: int  # 1-indexed, matches what the user sees in a PDF reader
     text: str
     tables: list[str] = field(default_factory=list)
     page_kind: PageKind = "text"
+    rotation: int = 0
 
 
 @dataclass

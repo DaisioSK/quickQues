@@ -14,6 +14,7 @@ Strategy:
 
 from __future__ import annotations
 
+import json
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -171,3 +172,150 @@ def test_file_not_found_raises(tmp_path):
     parser = RapidOcrParser(cache_dir=tmp_path / "cache", engine=MagicMock())
     with pytest.raises(FileNotFoundError):
         parser.parse(Path("does/not/exist.pdf"))
+
+
+# ---------------------------------------------------------------------------
+# ssRT auto-rotate: opt-in probe, rotation sidecar cache, rotation field
+# ---------------------------------------------------------------------------
+
+
+def _scored_result(
+    boxes: list[list[list[float]]], txts: tuple[str, ...], scores: tuple[float, ...]
+) -> types.SimpleNamespace:
+    """Fake RapidOCROutput with EXPLICIT scores (the probe gates on min)."""
+    return types.SimpleNamespace(boxes=boxes, txts=txts, scores=scores)
+
+
+def _page1_frames() -> dict[int, bytes]:
+    """The exact frames the parser will probe for fixture page 1.
+
+    render_pdf_page_jpeg produces byte-identical output to the parser's
+    internal render_page_jpeg (asserted by tests/test_pdfium_render.py),
+    so keying the fake engine by these bytes pins the whole probe path.
+    """
+    from jcontract.impls._page_orient import ROTATIONS, rotate_jpeg
+    from jcontract.impls._pdfium_render import render_pdf_page_jpeg
+    from jcontract.impls.rapidocr_parser import DEFAULT_DPI, DEFAULT_JPEG_QUALITY
+
+    base = render_pdf_page_jpeg(
+        SYNTHETIC_PDF, 1, dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
+    )
+    return {rot: rotate_jpeg(base, rot, jpeg_quality=DEFAULT_JPEG_QUALITY) for rot in ROTATIONS}
+
+
+def _frame_keyed_engine(table: dict[bytes, types.SimpleNamespace]) -> MagicMock:
+    return MagicMock(side_effect=lambda jpeg_bytes: table[jpeg_bytes])
+
+
+def test_default_parse_never_probes_and_rotation_is_zero(tmp_path):
+    """auto_rotate off (default): zero new files, zero extra engine calls."""
+    cache_dir = tmp_path / "cache"
+    engine = _make_engine([_box(10, 10, 100, 40)], ("plain text",))
+    pages = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1).parse(SYNTHETIC_PDF)
+
+    assert pages[0].rotation == 0
+    assert engine.call_count == 1
+    assert list(cache_dir.glob("*.rotation*.json")) == []
+
+
+def test_auto_rotate_good_page_probes_once_and_caches_decision(tmp_path):
+    """Gate-passing page: one engine run total (the probe IS the page OCR —
+    text + metrics land in the normal cache, _ocr_jpeg then cache-hits)."""
+    cache_dir = tmp_path / "cache"
+    frames = _page1_frames()
+    engine = _frame_keyed_engine(
+        {frames[0]: _scored_result([_box(10, 10, 100, 40)], ("good text",), (0.99,))}
+    )
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, auto_rotate=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].rotation == 0
+    assert pages[0].text == "good text"
+    assert engine.call_count == 1  # gate passed → no 4x probing
+    sidecars = list(cache_dir.glob("rapidocr-*.rotation.json"))
+    assert len(sidecars) == 1
+    decision = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert decision["rotation"] == 0
+    assert decision["gated"] is False
+
+
+def test_auto_rotate_low_quality_page_picks_winning_rotation(tmp_path):
+    """Gated page: four probes, the high-mass direction wins, the page's
+    text comes from the WINNING frame, and ParsedPage.rotation records it."""
+    cache_dir = tmp_path / "cache"
+    frames = _page1_frames()
+    engine = _frame_keyed_engine(
+        {
+            # rotation 0: low min_score (0.60 < 0.756 gate) + little text.
+            frames[0]: _scored_result(
+                [_box(10, 10, 100, 40), _box(10, 60, 100, 90)],
+                ("frag", "ment"),
+                (0.95, 0.60),
+            ),
+            # rotation 90: long confident text — the clear winner.
+            frames[90]: _scored_result(
+                [_box(10, 10, 400, 40), _box(10, 60, 400, 90)],
+                ("this is the recovered readable line", "and a second line"),
+                (0.98, 0.97),
+            ),
+            frames[180]: _scored_result([_box(10, 10, 50, 40)], ("junk",), (0.50,)),
+            frames[270]: _scored_result([_box(10, 10, 50, 40)], ("junk",), (0.50,)),
+        }
+    )
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, auto_rotate=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].rotation == 90
+    assert pages[0].text == "this is the recovered readable line\nand a second line"
+    # 4 probe runs, NO 5th run: the winning frame's probe already cached it.
+    assert engine.call_count == 4
+    sidecars = list(cache_dir.glob("rapidocr-*.rotation.json"))
+    assert len(sidecars) == 1
+    decision = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert decision["rotation"] == 90
+    assert decision["gated"] is True
+    assert set(decision["probes"]) == {"0", "90", "180", "270"}
+
+
+def test_auto_rotate_second_parse_reuses_cached_decision(tmp_path):
+    """Re-ingest must not re-probe: rotation sidecar + winner's text cache
+    make the second parse engine-free with the identical result."""
+    cache_dir = tmp_path / "cache"
+    frames = _page1_frames()
+    table = {
+        frames[0]: _scored_result([_box(10, 10, 100, 40)], ("frag",), (0.60,)),
+        frames[90]: _scored_result(
+            [_box(10, 10, 400, 40)], ("recovered readable line of text",), (0.98,)
+        ),
+        frames[180]: _scored_result([_box(10, 10, 50, 40)], ("j",), (0.50,)),
+        frames[270]: _scored_result([_box(10, 10, 50, 40)], ("j",), (0.50,)),
+    }
+    first = RapidOcrParser(
+        cache_dir=cache_dir, engine=_frame_keyed_engine(table), max_pages=1, auto_rotate=True
+    ).parse(SYNTHETIC_PDF)
+
+    engine_2 = MagicMock(side_effect=AssertionError("second parse must not OCR"))
+    second = RapidOcrParser(
+        cache_dir=cache_dir, engine=engine_2, max_pages=1, auto_rotate=True
+    ).parse(SYNTHETIC_PDF)
+
+    assert engine_2.call_count == 0
+    assert second[0].rotation == first[0].rotation == 90
+    assert second[0].text == first[0].text == "recovered readable line of text"
+
+
+def test_auto_rotate_engine_error_degrades_to_zero_and_does_not_cache(tmp_path):
+    """Transient engine failure: rotation 0, NO sidecar (next run retries),
+    page text falls back to the normal error stance ('' un-cached)."""
+    cache_dir = tmp_path / "cache"
+    engine = MagicMock(side_effect=RuntimeError("simulated engine failure"))
+    parser = RapidOcrParser(cache_dir=cache_dir, engine=engine, max_pages=1, auto_rotate=True)
+
+    pages = parser.parse(SYNTHETIC_PDF)
+
+    assert pages[0].rotation == 0
+    assert pages[0].text == ""
+    assert list(cache_dir.glob("*.rotation*.json")) == []
+    assert list(cache_dir.glob("rapidocr-*.txt")) == []

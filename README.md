@@ -114,6 +114,23 @@ CLI subscription (zero API key) via `JCONTRACT_ANSWERER_BACKEND`.
 | `deepseek-v4` | DeepSeek V4 Vision, per-token (cheapest API option) | `DEEPSEEK_API_KEY` (required) |
 | `rapidocr` | local CPU OCR (PP-OCRv5 via ONNX Runtime) — zero cost, fully offline after a one-time ~20MB model download; lower fidelity than LLM vision | none |
 
+#### Auto-rotate (`--auto-rotate`, rapidocr only, opt-in)
+
+Scanned corpora often contain sideways/upside-down pages that OCR into ordered
+fragments. With `--auto-rotate` (off by default — zero behaviour change), pages whose
+initial OCR quality is low (per-box `min_score < 0.756`, the same "low quality" signal
+`ocr-quality` flags on) are re-OCR'd in all four 90° rotations and the direction with
+the highest OCR mass (chars × mean confidence) wins, provided it beats the as-rendered
+frame by ≥1.10x. The decision (plus four-direction evidence) is cached in a
+`*.rotation.json` sidecar keyed by the original frame's hash, so re-ingest never
+re-probes; the upright frame's OCR lands in its own content-addressed cache entry.
+`table-preview --auto-rotate` reuses the same probe and sidecar before structuring.
+
+```bash
+uv run jcontract ingest scan.pdf --parser rapidocr --auto-rotate
+uv run jcontract table-preview scan.pdf --page 9 --auto-rotate --format elements
+```
+
 ### Redaction preview (`redact-preview`)
 
 Reversible pseudonymization for confidential corpora — a standalone mechanism component

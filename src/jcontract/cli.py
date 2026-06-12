@@ -248,6 +248,7 @@ def _build_parser(
     max_pages: int | None,
     vision_model: str | None = None,
     profile: DomainProfile | None = None,
+    auto_rotate: bool = False,
 ) -> PDFParser:
     """Select the PDFParser impl by name. Lazy imports keep heavy deps
     (anthropic / openai SDKs, pypdfium2 / sentence-transformers) out of
@@ -270,7 +271,15 @@ def _build_parser(
     "haiku" on claude-cli-vision). None keeps each parser's own default.
     Ignored for pypdf (no model) and deepseek-v4 (different model vocab —
     pick the variant via the deepseek parser default; FORESHADOW E10.1).
+
+    ssRT: ``auto_rotate`` enables the rapidocr orientation probe (sideways
+    pages get OCR'd upright). rapidocr-only by design — the LLM vision
+    vendors handle rotation inside the model and their lanes stay
+    untouched (ssRT scope line) — so any other parser rejects the flag
+    loudly instead of silently ignoring it.
     """
+    if auto_rotate and name != "rapidocr":
+        raise typer.BadParameter("--auto-rotate is only supported by --parser rapidocr")
     if name == "pypdf":
         return PyPdfParser()
     if name == "claude-vision":
@@ -297,7 +306,7 @@ def _build_parser(
         # profile / vision_model intentionally not forwarded: RapidOCR takes
         # no prompt — its output depends only on pixels + ONNX weights, so a
         # profile cannot change it and must not fork its cache namespace.
-        return RapidOcrParser(max_pages=max_pages)
+        return RapidOcrParser(max_pages=max_pages, auto_rotate=auto_rotate)
     raise typer.BadParameter(
         f"Unknown parser '{name}'. "
         f"Choose from: pypdf, claude-vision, claude-cli-vision, deepseek-v4, rapidocr."
@@ -367,6 +376,17 @@ def ingest(
             ),
         ),
     ] = "claude-cli",
+    auto_rotate: Annotated[
+        bool,
+        typer.Option(
+            "--auto-rotate/--no-auto-rotate",
+            help=(
+                "rapidocr only (ssRT): probe low-quality pages in four 90° "
+                "rotations and OCR the upright frame; decisions are cached "
+                "so re-ingest never re-probes. Off = pre-ssRT behaviour."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Parse, chunk, embed, and index one PDF into Qdrant + BM25 + RefGraph."""
     # Phase 7: the DomainProfile drives prompts + chunking structure, and is
@@ -389,7 +409,9 @@ def ingest(
         )
     try:
         pipeline = IngestPipeline(
-            parser=_build_parser(parser, max_pages, vision_model, profile=profile),
+            parser=_build_parser(
+                parser, max_pages, vision_model, profile=profile, auto_rotate=auto_rotate
+            ),
             chunker=QaAwareChunker(profile.structure),
             embedder=stack.embedder,
             vector_store=stack.vector_store,
@@ -1556,6 +1578,17 @@ def table_preview(
         Path | None,
         typer.Option(help="Write the result here instead of stdout."),
     ] = None,
+    auto_rotate: Annotated[
+        bool,
+        typer.Option(
+            "--auto-rotate/--no-auto-rotate",
+            help=(
+                "ssRT: resolve the page's orientation first (shared probe + "
+                "sidecar cache with ingest) and structure the upright frame; "
+                "the elements view records the applied rotation."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Structure one page's table via rapid-table SLANet-plus (ssTB).
 
@@ -1596,6 +1629,20 @@ def table_preview(
     except IndexError as exc:
         raise typer.BadParameter(f"page {page} is out of range for {pdf_path.name}") from exc
 
+    # ssRT: an upside-down/sideways table reads as garbage rows — resolve
+    # the orientation through the SAME probe + rotation-sidecar cache the
+    # ingest lane uses (the parser is only the probe's host here; its OCR
+    # caches are content-addressed so the probe work is shared, not
+    # duplicated), then structure the upright frame.
+    rotation = 0
+    if auto_rotate:
+        from jcontract.impls._page_orient import rotate_jpeg
+        from jcontract.impls.rapidocr_parser import RapidOcrParser
+
+        rotation = RapidOcrParser().resolve_rotation(jpeg_bytes, page, pdf_path.name)
+        if rotation:
+            jpeg_bytes = rotate_jpeg(jpeg_bytes, rotation, jpeg_quality=DEFAULT_JPEG_QUALITY)
+
     # Fresh OCR pass (~1s on CPU): the .txt OCR cache stores assembled text
     # only — table structuring needs the raw box geometry, which exists
     # exactly while the OCR engine result is in hand. The boxes then pass
@@ -1604,7 +1651,11 @@ def table_preview(
     ocr_results = page_ocr_results(jpeg_bytes)
     cells = structure_table(jpeg_bytes, ocr_results)
 
-    rendered = render_markdown(cells) if output_format == "md" else render_elements(cells)
+    rendered = (
+        render_markdown(cells)
+        if output_format == "md"
+        else render_elements(cells, rotation=rotation)
+    )
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(rendered + "\n", encoding="utf-8")
@@ -1619,6 +1670,8 @@ def table_preview(
         summary = f"{len(cells)} cell(s), {n_rows} row(s) x {n_cols} col(s)"
     else:
         summary = "no table structure detected"
+    if rotation:
+        summary += f" (frame auto-rotated {rotation}° CCW)"
     typer.echo(f"table-preview: {pdf_path.name} p.{page}: {summary}", err=True)
     if out is not None:
         typer.echo(f"table-preview: written to {out}", err=True)
