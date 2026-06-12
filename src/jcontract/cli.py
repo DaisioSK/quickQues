@@ -1335,6 +1335,19 @@ def redact_preview(
         Path | None,
         typer.Option(help="Write the result here instead of stdout."),
     ] = None,
+    # Tier is a per-invocation caller decision, deliberately NOT env-backed
+    # (deployment config it is not) [DECISION-tt.42].
+    tier: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "Replacement-set tier: 'standard' = dictionary + regex patterns only "
+                "(default, unchanged behaviour); 'strict' = additionally mask "
+                "capitalized-word sequences (<PN_N>) and >=2-digit strings (<NUM_N>) "
+                "— pre-cloud-dispatch setting, over-masks by design."
+            ),
+        ),
+    ] = "standard",
 ) -> None:
     """Reversible-pseudonymization demo over one text file (ssDI).
 
@@ -1358,7 +1371,12 @@ def redact_preview(
     if not dictionary.exists():
         raise typer.BadParameter(f"dictionary not found: {dictionary}")
 
-    redactor = DictRegexRedactor(dictionary_path=dictionary, store_path=map_store)
+    # Invalid --tier values fail fast as a CLI usage error (the impl raises
+    # ValueError; surface it as BadParameter so exit code/help are right).
+    try:
+        redactor = DictRegexRedactor(dictionary_path=dictionary, store_path=map_store, tier=tier)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
     text = text_file.read_text(encoding="utf-8")
     if restore:
         result_text = redactor.restore(text)
@@ -1367,7 +1385,7 @@ def redact_preview(
         result = redactor.redact(text)
         result_text = result.redacted_text
         summary = (
-            f"replaced {result.spans_replaced} span(s), "
+            f"tier={tier}: replaced {result.spans_replaced} span(s), "
             f"{result.mapping_delta} new mapping entrie(s) persisted"
         )
     if out is not None:

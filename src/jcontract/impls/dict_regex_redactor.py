@@ -13,6 +13,20 @@ recall comes from dictionary coverage.
 Mechanism only — NOT wired into ingest/answer (DECISION-cq.4). The only
 consumer is the ``redact-preview`` CLI demo command.
 
+Tiers [DECISION-tt.2]: the replacement set is selectable at construction.
+
+- ``standard`` (default): dictionary literals + regex whitelist only —
+  byte-for-byte the pre-tier behaviour, guarded by regression tests.
+- ``strict`` (pre-cloud-dispatch): adds two rule-based recognizers on top —
+  a proper-noun heuristic (capitalized-word sequences -> ``<PN_N>``) and a
+  digit-string recognizer (>=2 digits incl. thousands/decimal/phone
+  grouping -> ``<NUM_N>``). Strict semantics: cloud-dispatch safety beats
+  readability — over-masking is acceptable, a leak is the incident, so the
+  heuristics carry NO false-positive suppression (sentence-initial words
+  and ALL-CAPS headings are masked too) [DECISION-tt.40, DECISION-tt.41].
+  The lowercase function-word/verb skeleton survives, which is what the
+  cloud page-ordering task needs (DECISION-tt.2). No NER (cq.30/ls.2).
+
 Security discipline (dev-contract/21, the mapping store is the restore key):
 - Mapping/dictionary CONTENT (entity names) never enters logs, exception
   messages, or ``__repr__`` of any object in this module — reprs and errors
@@ -53,6 +67,36 @@ from jcontract.interfaces.redactor import RedactionResult
 _PLACEHOLDER_RE = re.compile(r"<([A-Z][A-Z0-9_]*)_(\d+)>")
 
 _TYPE_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+
+# Valid tier names; "standard" must stay the default forever (zero behaviour
+# change for existing callers is a regression-tested contract).
+_TIERS = ("standard", "strict")
+
+# --- strict-tier recognizers [DECISION-tt.2] -------------------------------
+#
+# Proper-noun heuristic: one or more capitalized words (digits/apostrophes
+# allowed after the initial capital, so "X107"/"O'Brien" are single words),
+# joined by horizontal whitespace, "&", or "-"; an abbreviation dot joins
+# only when another capitalized word follows ("Pte. Ltd." is one span, a
+# sentence-final dot is left in place so the mapping key for a name is the
+# same with or without trailing punctuation).
+#
+# What/Why: no word-boundary anchor on purpose — "\b" fails after CJK
+# characters ("中文Apple") and a left-context guard would skip mid-word
+# capitals; the scanner masking ANY capital run is the safe direction
+# (multi-mask > leak) [DECISION-tt.40]. Sequences never join across
+# newlines: a heading and the next line's sentence-initial word must not
+# fuse into one giant mapping key.
+_PN_WORD = r"[A-Z][A-Za-z0-9'’]*"
+_PROPER_NOUN_RE = re.compile(rf"{_PN_WORD}(?:(?:\.?[ \t]+|[ \t]*&[ \t]*|-){_PN_WORD})*")
+
+# Digit-string recognizer: digit groups joined by "," "." "-" or a single
+# space (thousands separators, decimals, dates, phone segmentation), kept
+# only when the match carries >=2 digit characters in total. A lone digit
+# ("Section 7") is below the user-decided >=2 floor and stays
+# [DECISION-tt.41]. No boundary anchors for the same reason as above
+# ("x107" must still surrender its "107").
+_DIGIT_RUN_RE = re.compile(r"\d+(?:[,.\- ]\d+)*")
 
 
 class JsonlMappingStore:
@@ -144,9 +188,20 @@ class DictRegexRedactor:
     then non-overlapping spans are substituted; this preserves the
     "replaced interval text == mapping key" invariant that byte-exact
     restore requires (REMOVE_INTERSECTIONS-equivalent, DECISION-ls.41).
+
+    ``tier="strict"`` additionally runs the proper-noun and digit-string
+    recognizers (module docstring); ``tier="standard"`` (default) is the
+    unchanged dictionary+regex behaviour [DECISION-tt.2].
     """
 
-    def __init__(self, dictionary_path: Path, store_path: Path) -> None:
+    def __init__(self, dictionary_path: Path, store_path: Path, tier: str = "standard") -> None:
+        # Tier is a constructor parameter, not an env var: which replacement
+        # set to apply is a per-call-site decision (e.g. "this text is about
+        # to leave the machine"), not deployment configuration
+        # [DECISION-tt.42].
+        if tier not in _TIERS:
+            raise ValueError(f"unknown tier {tier!r}; expected one of {_TIERS}")
+        self._tier = tier
         self._dictionary_path = dictionary_path
         self._store = JsonlMappingStore(store_path)
         self._literals: list[tuple[str, str]] = []  # (entity_type, literal)
@@ -209,6 +264,19 @@ class DictRegexRedactor:
             for match in compiled.finditer(text):
                 if match.start() < match.end():  # ignore zero-width matches
                     spans.append((match.start(), match.end(), etype))
+        if self._tier == "strict":
+            # Heuristic candidates feed the SAME selection/mapping machinery
+            # as dictionary hits: longest-span-wins keeps dictionary entries
+            # (usually longer, typed) on top where they overlap, and the
+            # shared store gives same-word-same-token across calls/sessions.
+            for match in _PROPER_NOUN_RE.finditer(text):
+                spans.append((match.start(), match.end(), "PN"))
+            for match in _DIGIT_RUN_RE.finditer(text):
+                # Enforce the >=2-digits floor over the WHOLE match so that
+                # separator-joined groups of single digits ("1-2") are still
+                # masked — multi-mask over leak [DECISION-tt.41].
+                if sum(ch.isdigit() for ch in match.group(0)) >= 2:
+                    spans.append((match.start(), match.end(), "NUM"))
         return spans
 
     @staticmethod
@@ -275,8 +343,8 @@ class DictRegexRedactor:
 
         return _PLACEHOLDER_RE.sub(_sub, text)
 
-    def __repr__(self) -> str:  # content red line: counts only
+    def __repr__(self) -> str:  # content red line: counts + tier name only
         return (
-            f"DictRegexRedactor(literals={len(self._literals)}, "
+            f"DictRegexRedactor(tier={self._tier!r}, literals={len(self._literals)}, "
             f"patterns={len(self._patterns)}, store={self._store!r})"
         )

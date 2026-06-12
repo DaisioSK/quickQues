@@ -122,6 +122,12 @@ replace sensitive mentions with corpus-stable `<TYPE_N>` placeholders; a persist
 mapping store guarantees the same entity gets the same placeholder across files and
 sessions, and `--restore` reverses byte-exactly. Zero new dependencies, no NER.
 
+`--tier strict` (default: `standard`, the behaviour above) additionally masks every
+capitalized-word sequence (`<PN_N>`) and every >=2-digit string (`<NUM_N>`) — a
+deliberately over-masking, rule-based setting for text that is about to leave the
+machine; the lowercase word skeleton survives and the result restores byte-exactly
+through the same mapping store.
+
 ```bash
 # dictionary + mapping store live in YOUR data directory, never in this repo;
 # the mapping store is the restore key — gitignore it.
