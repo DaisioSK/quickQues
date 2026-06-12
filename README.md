@@ -154,6 +154,27 @@ uv run jcontract ocr-quality scan.pdf --flag-above n_columns:1 --flag-above max_
 uv run jcontract ingest scan.pdf --parser rapidocr --assembly regions
 ```
 
+#### Needs-vision classifier v2 (`JCONTRACT_PAGE_CLASSIFY=v2`, rapidocr only, opt-in)
+
+The text-vs-drawing verdict (`page_kind`) gates the drawing/caption lane. The default
+v1 classifier is pixel-only and has two known failure classes: dense spec drawings /
+maps / charts pass as "text" (their graphics never become retrievable), and near-empty
+divider/title pages trigger as "drawing" (wasted captions — measured 64.5% empty). With
+`JCONTRACT_PAGE_CLASSIFY=v2` (default `v1` — zero behaviour change) the rapidocr parser
+re-frames the question as "is the text alone enough?": pages whose OCR text arrives as
+many small fragment boxes (mean box area < 0.1% of the page) are drawings; pages with
+almost no box coverage *and* almost no ink are empty-ish dividers and stay text. Box
+statistics are reused from the metrics sidecar (`boxes`, `box_coverage`); pages whose
+cached sidecar predates the geometry signals keep the v1 verdict (existing sidecars are
+never rewritten — re-OCR into a fresh cache for full v2 coverage). The verdict is
+biased toward "drawing" on ambiguity: captions are additive (OCR text still indexes),
+while a missed drawing is permanently unretrievable. LLM vision parsers have no box
+data and always use v1.
+
+```bash
+JCONTRACT_PAGE_CLASSIFY=v2 uv run jcontract ingest scan.pdf --parser rapidocr --caption
+```
+
 ### Redaction preview (`redact-preview`)
 
 Reversible pseudonymization for confidential corpora — a standalone mechanism component

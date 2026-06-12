@@ -51,6 +51,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -61,7 +62,7 @@ import structlog
 from PIL import Image
 
 from jcontract.impls._ocr_cache_key import model_cache_suffix
-from jcontract.impls._page_classify import _classify_page
+from jcontract.impls._page_classify import _classify_page, classify_page_v2
 from jcontract.impls._page_geometry import assemble_regions, page_geometry
 from jcontract.impls._page_orient import probe_rotation, rotate_jpeg
 from jcontract.impls._pdfium_render import render_page_jpeg
@@ -82,6 +83,15 @@ DEFAULT_JPEG_QUALITY = 85
 # the constructor; a non-default choice gets its own cache namespace.
 DEFAULT_MODEL_TYPE = "mobile"
 _MODEL_SLUG_TEMPLATE = "ppocrv5-{model_type}"
+
+# ssVR: page-classification versions. "v1" is the frozen pixel heuristic
+# (shared with the LLM vendors); "v2" is the opt-in OCR-box + pixel judge
+# (classify_page_v2). Selected per-parser via the constructor, with the
+# JCONTRACT_PAGE_CLASSIFY env var as the cross-command default — see
+# _resolve_classify_version. [DECISION-pl.31]
+DEFAULT_CLASSIFY_VERSION = "v1"
+CLASSIFY_VERSIONS = ("v1", "v2")
+CLASSIFY_ENV_VAR = "JCONTRACT_PAGE_CLASSIFY"
 
 # ssGE: the two reading-order assembly modes. "default" is the historical
 # y-band sweep (_assemble_reading_order, frozen); "regions" is the opt-in
@@ -196,6 +206,26 @@ def _assemble_reading_order(boxes: Sequence[Sequence[Sequence[float]]], txts: Se
     return "\n".join(" ".join(txt for _, txt in sorted(line)) for line in lines)
 
 
+def _resolve_classify_version(classify_version: str | None) -> str:
+    """Resolve the page-classification version: explicit arg > env > default.
+
+    Why an env var (JCONTRACT_PAGE_CLASSIFY) and not a CLI flag
+    [DECISION-pl.31]: the classifier choice is an ingest-pipeline policy,
+    not a per-invocation knob — one env switch flips every command that
+    constructs this parser without threading a flag through N typer
+    signatures (the ssRT/ssGE flags went the CLI route because they fork
+    cache namespaces per run; the classifier verdict touches no cache).
+    Safe default: unset → "v1" → byte-identical behaviour. An unknown value
+    raises loudly (never silently degrade a classification request).
+    """
+    resolved = classify_version or os.environ.get(CLASSIFY_ENV_VAR) or DEFAULT_CLASSIFY_VERSION
+    if resolved not in CLASSIFY_VERSIONS:
+        raise ValueError(
+            f"page classify version must be one of {CLASSIFY_VERSIONS}, got {resolved!r}"
+        )
+    return resolved
+
+
 def _jpeg_size(jpeg_bytes: bytes) -> tuple[int, int]:
     """(width, height) of a JPEG frame — header parse only, no pixel decode.
 
@@ -234,6 +264,7 @@ class RapidOcrParser:
         auto_classify: bool = True,
         auto_rotate: bool = False,
         assembly: str = DEFAULT_ASSEMBLY,
+        classify_version: str | None = None,
     ) -> None:
         # Tests inject a fake ``engine`` callable; production lazily builds
         # the real RapidOCR pipeline on first use (_ensure_engine) so that
@@ -251,6 +282,13 @@ class RapidOcrParser:
         # does NOT touch the cache key — it only sets ParsedPage.page_kind.
         # auto_classify=False forces "text" for every page (eval baselines).
         self._auto_classify = auto_classify
+        # ssVR: which classifier judges page_kind. "v1" (default) keeps the
+        # frozen pixel heuristic; "v2" judges from OCR-box stats + ink (see
+        # classify_page_v2). None defers to the JCONTRACT_PAGE_CLASSIFY env
+        # var so one switch covers every construction site; the verdict
+        # never touches the OCR text or any cache namespace, so no suffix
+        # forking is needed (unlike model/assembly). [DECISION-pl.31]
+        self._classify_version = _resolve_classify_version(classify_version)
         # ssRT: opt-in orientation probe. When True, pages whose rotation-0
         # frame is low quality (min_score < GATE_MIN_SCORE, DECISION-pl.11)
         # get the four-direction OCR-mass comparison; the winning rotation
@@ -354,6 +392,12 @@ class RapidOcrParser:
         ParsedPage — sees the upright frame; the chosen rotation rides
         along on ``ParsedPage.rotation`` so the caption lane can rotate
         its own render the same way.
+
+        ssVR ordering: OCR runs BEFORE classification (the ``text=`` line
+        precedes the ``page_kind=`` evaluation) — required by v2, whose box
+        signals come from the metrics sidecar the OCR step just wrote. v1
+        never reads OCR output, so the shared ordering changes nothing for
+        it. [DECISION-pl.33]
         """
         jpeg_bytes = render_page_jpeg(page, dpi=self._dpi, jpeg_quality=self._jpeg_quality)
         rotation = 0
@@ -379,6 +423,8 @@ class RapidOcrParser:
         if not self._auto_classify:
             return "text"
         try:
+            if self._classify_version == "v2":
+                return self._classify_v2(jpeg_bytes, page_num, pdf_name)
             return self._classify(jpeg_bytes)
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -387,6 +433,41 @@ class RapidOcrParser:
                 page=page_num,
             )
             return "text"
+
+    def _classify_v2(self, jpeg_bytes: bytes, page_num: int, pdf_name: str) -> PageKind:
+        """ssVR v2 verdict for one (upright) frame from sidecar box signals.
+
+        The box statistics are READ from the metrics sidecar these bytes
+        already own — _parse_page runs OCR first [DECISION-pl.33], so a
+        fresh engine run has just written it. The only miss case is a
+        pre-ssQA/ssGE cache (.txt without sidecar geometry): backfilling
+        would force an engine run inside ingest (the exact regression
+        DECISION-cq.21 forbids) and existing sidecars are never rewritten
+        (DECISION-cq.22), so v2 defers to v1 for that page instead —
+        classify_page_v2 handles the None signals and logs the fallback.
+        Re-OCR into a fresh cache when full v2 coverage matters.
+        [DECISION-pl.33]
+        """
+        cache_key = hashlib.sha256(jpeg_bytes).hexdigest()
+        metrics_path = self._metrics_path(cache_key)
+        boxes: int | None = None
+        box_coverage: float | None = None
+        if metrics_path.exists():
+            metrics: dict[str, Any] = json.loads(metrics_path.read_text(encoding="utf-8"))
+            raw_boxes = metrics.get("boxes")
+            raw_coverage = metrics.get("box_coverage")
+            boxes = int(raw_boxes) if raw_boxes is not None else None
+            box_coverage = float(raw_coverage) if raw_coverage is not None else None
+        verdict = classify_page_v2(jpeg_bytes, boxes=boxes, box_coverage=box_coverage)
+        logger.info(
+            "rapidocr_parser.classify_v2",
+            pdf=pdf_name,
+            page=page_num,
+            verdict=verdict,
+            boxes=boxes,
+            box_coverage=box_coverage,
+        )
+        return verdict
 
     def _classify(self, jpeg_bytes: bytes) -> PageKind:
         """Indirection so tests can monkeypatch classification on the instance.

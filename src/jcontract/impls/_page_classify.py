@@ -5,6 +5,13 @@ What:
     heuristic (dark-pixel ratio + edge-energy row distribution) that
     decides whether a rendered page is text-heavy or drawing-heavy.
 
+    ``classify_page_v2(jpeg_bytes, boxes=, box_coverage=) -> PageKind`` —
+    the ssVR "needs vision" judge: same question re-framed as "is the text
+    alone enough to carry this page's information?", answered from OCR box
+    statistics (box count + the ssGE ``box_coverage`` signal, reused not
+    recomputed) joined with the v1 pixel ink signal. Opt-in; only the
+    rapidocr lane has box data to feed it [DECISION-pl.32].
+
 Why a shared module (ssCL):
     The heuristic was born in claude_vision_parser (Phase 1.7) and was
     already imported by deepseek_v4_parser (N=2 / §5.3: calibration
@@ -15,7 +22,8 @@ Why a shared module (ssCL):
     import the Anthropic vendor's module. The function body and all
     threshold constants are moved verbatim (pure relocation, zero
     behaviour change); claude_vision_parser re-exports them so existing
-    imports keep working.
+    imports keep working. ssVR adds v2 beside v1 in the same home for the
+    same reason: one module owns every page-classification threshold.
 """
 
 from __future__ import annotations
@@ -141,6 +149,137 @@ def _classify_page(jpeg_bytes: bytes) -> PageKind:
         # prompt — see docstring.
         logger.warning("vision_parser.classify_error_fallback_text")
         return "text"
+
+
+# ---------------------------------------------------------------------------
+# ssVR: classify_page_v2 — "needs vision" judge from OCR-box + pixel signals
+# ---------------------------------------------------------------------------
+#
+# v2 tunables [DECISION-pl.30]. Calibrated live (2026-06-12) on the frozen
+# 14-page set (dev-sprint v7 §13, ssVR): 6 drawing pages (rotated schedule
+# diagrams, a linkway spec drawing, a rotated tender-drawings list) vs 8 text
+# pages (5 plain/table text pages + 3 near-empty divider/title pages).
+# Signals measured on the UPRIGHT frame (after the ssRT rotation step):
+#
+#                         dark    boxes   box_coverage   coverage/boxes
+#   drawings (5 pp)      .035-.111  51-276   .030-.199    .00048-.00072
+#   dense text (6 pp)    .056-.120  42-146   .203-.543    .00139-.0111
+#   title pages (3 pp)   .003-.008   2-4     .0074-.021   .0037-.0063
+#
+# The dominant discriminator is MEAN BOX AREA (box_coverage / boxes): a
+# drawing's text arrives as many small fragments (dimension labels, title
+# blocks), a text page's as full-width line boxes — the two populations are
+# separated 1.39x on each side of 0.001 (geometric midpoint of .00072 vs
+# .00139), where raw box_coverage alone leaves only a 1.018x gap
+# (.199 drawing vs .2026 text). Title pages ("空旷页") are carved out FIRST
+# by the sparse rule — almost no box coverage AND almost no ink means the
+# few words ARE the whole page, so captioning buys nothing (this kills the
+# v5 over-trigger: 64.5% empty captions on appendix title pages).
+#
+# Bias [DECISION-pl.30]: when in doubt, send to vision. The caption lane is
+# ADDITIVE (a drawing page's OCR text still enters the index), so a false
+# "drawing" costs GPU seconds while a false "text" makes the image's meaning
+# permanently unretrievable. Hence the sparse rule requires BOTH signals to
+# be near-zero, and every other ambiguous branch falls through toward the
+# fragmentation test rather than an early "text".
+#
+# V2_SPARSE_COVER / V2_SPARSE_DARK: a page is "empty-ish" (→ text) only when
+# box coverage AND ink are both tiny. Margins on the calibration set: title
+# pages max cover .021 (4.8x under .10) and max dark .008 (2.5x under .02);
+# the sparsest real drawing (p.559 linkway spec) clears the dark bar at .042
+# (2.1x over) so it falls through to the fragmentation test.
+V2_SPARSE_COVER = 0.10
+V2_SPARSE_DARK = 0.02
+# V2_FRAGMENT_BOX_FRAC: mean box area (box_coverage / boxes) below this →
+# the page's text is fragmented labels → drawing. 0.001 is the geometric
+# midpoint of the calibration populations (drawings ≤ .00072, text pages
+# ≥ .00139 — 1.39x margin each side).
+V2_FRAGMENT_BOX_FRAC = 0.001
+# Heavily-inked pages (photos / halftones) route to drawing regardless of
+# box stats — inherited unchanged from v1 (_FILLED_DARK_RATIO).
+V2_FILLED_DARK_RATIO = _FILLED_DARK_RATIO
+
+
+def _dark_ratio(jpeg_bytes: bytes) -> float:
+    """v1's ink signal in isolation (same decode → grayscale → 512px → t180).
+
+    Extracted for v2 instead of calling ``_classify_page`` because v2 needs
+    the raw ratio, not v1's verdict; ``_classify_page`` itself stays frozen
+    verbatim (zero-default-change mandate — its early-return structure means
+    sharing this helper would alter its blank/filled fast paths).
+    """
+    with Image.open(io.BytesIO(jpeg_bytes)) as raw:
+        gray = raw.convert("L")
+    gray.thumbnail((512, 512), Image.Resampling.BILINEAR)
+    width, height = gray.size
+    n_pixels = width * height
+    if n_pixels == 0:
+        return 0.0
+    dark_count = sum(1 for p in gray.getdata() if p < _DARK_THRESHOLD)
+    return float(dark_count) / float(n_pixels)
+
+
+def classify_page_v2(
+    jpeg_bytes: bytes,
+    *,
+    boxes: int | None,
+    box_coverage: float | None,
+) -> PageKind:
+    """ssVR v2 verdict: is this page's information carried by its text alone?
+
+    Inputs: the rendered UPRIGHT frame (callers must resolve ssRT rotation
+    first — sideways pixels make the ink signal noise) plus the OCR box
+    statistics from the rapidocr metrics sidecar: ``boxes`` (ssQA) and
+    ``box_coverage`` (ssGE — reused, never recomputed here).
+
+    Decision (in order) [DECISION-pl.30]:
+      1. Box signals unavailable (pre-ssGE sidecar, no sidecar) → defer to
+         the v1 pixel heuristic — v2 never guesses without its evidence.
+      2. ``boxes == 0`` → drawing: no text at all, so whatever ink exists
+         is purely graphical (and a truly blank page matches v1's cheap
+         blank→drawing sentinel path).
+      3. Ink > ``V2_FILLED_DARK_RATIO`` → drawing (photo/halftone; v1 rule
+         carried over).
+      4. Sparse page (coverage < ``V2_SPARSE_COVER`` AND ink <
+         ``V2_SPARSE_DARK``) → text: divider/title pages — the few words
+         are the whole page, captioning them yields empty captions.
+      5. Fragmented text (``box_coverage / boxes`` < ``V2_FRAGMENT_BOX_FRAC``)
+         → drawing: many small label boxes = spec drawings / maps / charts
+         (the v1 under-trigger class).
+      6. Otherwise → text.
+
+    Failure mode: any unexpected error (corrupt JPEG, PIL OOM) defers to
+    ``_classify_page`` — which itself degrades to "text" — so a page is
+    never lost to classification (same belt-and-braces stance as v1).
+    """
+    try:
+        if boxes is None or box_coverage is None:
+            # No box evidence (pre-ssGE/ssQA caches, vendor without boxes):
+            # fall back to the v1 verdict rather than judging blind.
+            logger.info("page_classify.v2_no_box_signals_fallback_v1")
+            return _classify_page(jpeg_bytes)
+
+        if boxes == 0:
+            # No text anywhere: ink (if any) is purely graphical; a blank
+            # page rides the drawing prompt's cheap empty-page branch (v1
+            # parity).
+            return "drawing"
+
+        dark_ratio = _dark_ratio(jpeg_bytes)
+        if dark_ratio > V2_FILLED_DARK_RATIO:
+            return "drawing"
+        if box_coverage < V2_SPARSE_COVER and dark_ratio < V2_SPARSE_DARK:
+            return "text"
+        if box_coverage / boxes < V2_FRAGMENT_BOX_FRAC:
+            return "drawing"
+        return "text"
+
+    except Exception:  # noqa: BLE001
+        # Why broad except: classification is a non-critical preflight — any
+        # failure must not drop the page. v1 is the defined degraded mode
+        # (and v1 itself degrades to "text").
+        logger.warning("page_classify.v2_error_fallback_v1")
+        return _classify_page(jpeg_bytes)
 
 
 # `_ImageStat` is re-exported so future calibrators (e.g. mean luminance
