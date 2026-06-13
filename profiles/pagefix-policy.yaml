@@ -1,0 +1,42 @@
+# Pagefix policy — the four ssPageFix valves' toggles + thresholds (DECISION-pm.2).
+#
+# This is the framework DEFAULT档. Every value below is byte-equal to the
+# current hard-coded module constants, so loading this policy reproduces the
+# present behaviour exactly. A project may ship its own pagefix-policy.yaml
+# (point JCONTRACT_PAGEFIX_POLICY at its directory, or pass an explicit path)
+# and need only state the keys it changes — unstated keys keep these defaults.
+#
+# Loaded by jcontract.impls._pagefix_policy.load_policy. The threshold values
+# here are mirrored from the in-code dataclass defaults purely for visibility;
+# the dataclass (which imports the live constants) is the source of truth, so
+# deleting this file falls back to identical built-in defaults.
+#
+# Per-valve defaults (DECISION-pm.3, data-driven from v7 W6):
+#   rotate / rescue = ON   (low-risk, valve-gated, net-positive on the corpus)
+#   regions / v2    = OFF   (net-negative on this corpus — regions hurts clause
+#                            pages, v2 over-sends to vision: recall 1.0 -> 0.78)
+# NOTE: these toggles are consumed by the policy-trace mock surface only; the
+# real ingest pipeline keeps its own opt-in CLI flag defaults (FORESHADOW-pm.1).
+
+valves:
+  rotate: true          # ssRT orientation probe
+  regions: false        # ssGE strip->column region assembly
+  needs_vision_v2: false  # ssVR OCR-box needs-vision classifier
+  rescue: true          # ssHD DPI-escalation rescue
+
+# ssRT — orientation probe (_page_orient.probe_rotation)
+ssrt:
+  gate_min_score: 0.756     # GATE_MIN_SCORE — probe extra rotations below this
+  improvement_factor: 1.10  # IMPROVEMENT_FACTOR — anti-noise winning margin
+
+# ssVR — needs-vision classifier v2 (_page_classify.classify_page_v2)
+ssvr:
+  v2_sparse_cover: 0.10        # V2_SPARSE_COVER — title/divider carve-out
+  v2_sparse_dark: 0.02         # V2_SPARSE_DARK
+  v2_fragment_box_frac: 0.001  # V2_FRAGMENT_BOX_FRAC — mean box area -> drawing
+  v2_filled_dark_ratio: 0.5    # V2_FILLED_DARK_RATIO — photo/halftone -> drawing
+
+# ssHD — DPI-escalation rescue (rapidocr_parser)
+sshd:
+  rescue_dpi: 300           # RESCUE_DPI — single 150->300 escalation step
+  rescue_min_score: 0.756   # RESCUE_MIN_SCORE — rescue gate (shares ssRT semantics)

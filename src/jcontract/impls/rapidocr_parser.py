@@ -55,7 +55,7 @@ import os
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pypdfium2 as pdfium
 import structlog
@@ -73,6 +73,13 @@ from jcontract.impls._page_orient import (
 )
 from jcontract.impls._pdfium_render import render_page_jpeg
 from jcontract.interfaces import PageKind, ParsedPage
+
+if TYPE_CHECKING:
+    # Import-only for the type annotation: _pagefix_policy imports this
+    # module's RESCUE_* constants, so a runtime import here would be a
+    # cycle. The policy object is passed in by the caller (ssCfg) at
+    # construction; nothing in the default path constructs one.
+    from jcontract.impls._pagefix_policy import PagefixPolicy
 
 logger = structlog.get_logger(__name__)
 
@@ -285,6 +292,7 @@ class RapidOcrParser:
         classify_version: str | None = None,
         dpi_rescue: bool = False,
         rescue_min_score: float = RESCUE_MIN_SCORE,
+        policy: PagefixPolicy | None = None,
     ) -> None:
         # Tests inject a fake ``engine`` callable; production lazily builds
         # the real RapidOCR pipeline on first use (_ensure_engine) so that
@@ -339,6 +347,17 @@ class RapidOcrParser:
         # rotation sidecar, DECISION-pl.12). Default False = zero behaviour
         # change for every existing caller. [DECISION-pl.40]
         self._dpi_rescue = dpi_rescue
+        # ssCfg: an optional PagefixPolicy injects the v2 classifier
+        # thresholds (and the rescue gate) from config instead of the frozen
+        # module constants. None (the default for every existing caller) =
+        # the constants are used, so behaviour is byte-unchanged; an explicit
+        # rescue_min_score arg still wins over a policy's value for back-
+        # compat. The policy's valve TOGGLES are NOT consulted here — the
+        # pipeline keeps its own auto_rotate/dpi_rescue/classify_version
+        # flags (wiring those to the policy is FORESHADOW-pm.1). [DECISION-pm.12]
+        self._policy = policy
+        if policy is not None and rescue_min_score == RESCUE_MIN_SCORE:
+            rescue_min_score = policy.rescue_min_score
         self._rescue_min_score = rescue_min_score
         # RapidOCR's pipeline mutates per-call internal buffers; nothing in
         # the codebase calls this vendor concurrently today (batch-ingest
@@ -497,7 +516,18 @@ class RapidOcrParser:
             raw_coverage = metrics.get("box_coverage")
             boxes = int(raw_boxes) if raw_boxes is not None else None
             box_coverage = float(raw_coverage) if raw_coverage is not None else None
-        verdict = classify_page_v2(jpeg_bytes, boxes=boxes, box_coverage=box_coverage)
+        if self._policy is not None:
+            verdict = classify_page_v2(
+                jpeg_bytes,
+                boxes=boxes,
+                box_coverage=box_coverage,
+                sparse_cover=self._policy.v2_sparse_cover,
+                sparse_dark=self._policy.v2_sparse_dark,
+                fragment_box_frac=self._policy.v2_fragment_box_frac,
+                filled_dark_ratio=self._policy.v2_filled_dark_ratio,
+            )
+        else:
+            verdict = classify_page_v2(jpeg_bytes, boxes=boxes, box_coverage=box_coverage)
         logger.info(
             "rapidocr_parser.classify_v2",
             pdf=pdf_name,
@@ -588,10 +618,20 @@ class RapidOcrParser:
             decision: dict[str, Any] = json.loads(rotation_path.read_text(encoding="utf-8"))
             return int(decision["rotation"])
 
+        # ssCfg: a policy injects the ssRT gate/margin from config; with no
+        # policy the probe_rotation kwargs keep their constant defaults
+        # (byte-unchanged for every existing caller). [DECISION-pm.12]
+        rt_kwargs: dict[str, float] = {}
+        if self._policy is not None:
+            rt_kwargs = {
+                "gate_min_score": self._policy.gate_min_score,
+                "improvement_factor": self._policy.improvement_factor,
+            }
         rotation, evidence = probe_rotation(
             jpeg_bytes,
             lambda frame: self._ocr_with_scores(frame, page_num, pdf_name),
             jpeg_quality=self._jpeg_quality,
+            **rt_kwargs,
         )
         if evidence.get("engine_error"):
             logger.warning(

@@ -224,6 +224,10 @@ def classify_page_v2(
     *,
     boxes: int | None,
     box_coverage: float | None,
+    sparse_cover: float = V2_SPARSE_COVER,
+    sparse_dark: float = V2_SPARSE_DARK,
+    fragment_box_frac: float = V2_FRAGMENT_BOX_FRAC,
+    filled_dark_ratio: float = V2_FILLED_DARK_RATIO,
 ) -> PageKind:
     """ssVR v2 verdict: is this page's information carried by its text alone?
 
@@ -232,18 +236,22 @@ def classify_page_v2(
     statistics from the rapidocr metrics sidecar: ``boxes`` (ssQA) and
     ``box_coverage`` (ssGE — reused, never recomputed here).
 
+    The four thresholds are keyword args defaulting to the calibrated module
+    constants, so existing callers are byte-unchanged; a PagefixPolicy-driven
+    caller (ssCfg) injects them from config instead. [DECISION-pm.11]
+
     Decision (in order) [DECISION-pl.30]:
       1. Box signals unavailable (pre-ssGE sidecar, no sidecar) → defer to
          the v1 pixel heuristic — v2 never guesses without its evidence.
       2. ``boxes == 0`` → drawing: no text at all, so whatever ink exists
          is purely graphical (and a truly blank page matches v1's cheap
          blank→drawing sentinel path).
-      3. Ink > ``V2_FILLED_DARK_RATIO`` → drawing (photo/halftone; v1 rule
+      3. Ink > ``filled_dark_ratio`` → drawing (photo/halftone; v1 rule
          carried over).
-      4. Sparse page (coverage < ``V2_SPARSE_COVER`` AND ink <
-         ``V2_SPARSE_DARK``) → text: divider/title pages — the few words
-         are the whole page, captioning them yields empty captions.
-      5. Fragmented text (``box_coverage / boxes`` < ``V2_FRAGMENT_BOX_FRAC``)
+      4. Sparse page (coverage < ``sparse_cover`` AND ink < ``sparse_dark``)
+         → text: divider/title pages — the few words are the whole page,
+         captioning them yields empty captions.
+      5. Fragmented text (``box_coverage / boxes`` < ``fragment_box_frac``)
          → drawing: many small label boxes = spec drawings / maps / charts
          (the v1 under-trigger class).
       6. Otherwise → text.
@@ -266,11 +274,11 @@ def classify_page_v2(
             return "drawing"
 
         dark_ratio = _dark_ratio(jpeg_bytes)
-        if dark_ratio > V2_FILLED_DARK_RATIO:
+        if dark_ratio > filled_dark_ratio:
             return "drawing"
-        if box_coverage < V2_SPARSE_COVER and dark_ratio < V2_SPARSE_DARK:
+        if box_coverage < sparse_cover and dark_ratio < sparse_dark:
             return "text"
-        if box_coverage / boxes < V2_FRAGMENT_BOX_FRAC:
+        if box_coverage / boxes < fragment_box_frac:
             return "drawing"
         return "text"
 

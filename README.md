@@ -199,6 +199,29 @@ data and always use v1.
 JCONTRACT_PAGE_CLASSIFY=v2 uv run jcontract ingest scan.pdf --parser rapidocr --caption
 ```
 
+#### Pagefix policy (`pagefix-policy.yaml`, `JCONTRACT_PAGEFIX_POLICY`)
+
+The four page-fix valves (orientation probe, region assembly, needs-vision v2,
+DPI-escalation rescue) keep their thresholds and per-valve on/off toggles in one
+data-config object, `PagefixPolicy`, loaded from `profiles/pagefix-policy.yaml`
+(the framework default档). `load_policy()` with no argument returns a built-in
+default that is **byte-equal to the historical hard-coded constants** — so the
+default policy reproduces the present behaviour exactly. A project may ship its
+own `pagefix-policy.yaml` and point `JCONTRACT_PAGEFIX_POLICY` at its directory
+(the same override pattern as `JCONTRACT_PROFILES_DIR`), or pass an explicit
+path; a partial file overrides only the keys it names. The per-valve defaults
+are decoupled from the data (rotate/rescue **on**, regions/v2 **off**), but
+those toggles are consumed only by the policy-trace tooling — the ingest
+pipeline keeps its own opt-in CLI-flag defaults (wiring the pipeline to read
+the policy is a deliberate follow-up). Thresholds are runtime strategy, not
+toolchain config, so the policy lives next to `profiles/*.yaml`, never in
+`pyproject.toml`.
+
+```bash
+# use a project-local policy directory holding pagefix-policy.yaml
+JCONTRACT_PAGEFIX_POLICY=path/to/policies uv run jcontract ingest scan.pdf --parser rapidocr
+```
+
 ### Redaction preview (`redact-preview`)
 
 Reversible pseudonymization for confidential corpora — a standalone mechanism component
