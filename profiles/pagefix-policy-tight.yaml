@@ -1,0 +1,18 @@
+# Example "tight" pagefix policy — a calibration knob demo, NOT a shipped
+# default. It tightens ONLY the ssVR fragmentation threshold (mean box area
+# below which a page is judged a fragmented spec/map/chart -> drawing) from
+# the default 0.001 to 0.0005, i.e. a page's text must be HALF as fragmented
+# before it routes to the vision/caption lane. Net effect: fewer pages judged
+# drawing (the borderline fragmented pages flip back to text).
+#
+# Use with `policy-trace <corpus.jsonl> --diff default pagefix-policy-tight`
+# to see exactly which pages flip and why — the whole point of ssMock.
+#
+# Unstated keys inherit the built-in defaults (the partial-override loader
+# contract), so everything except v2_fragment_box_frac matches pagefix-policy.yaml.
+
+valves:
+  needs_vision_v2: true   # surface the v2 verdict as the active routing decision
+
+ssvr:
+  v2_fragment_box_frac: 0.0005  # 0.001 -> 0.0005: harder to call a page "drawing"

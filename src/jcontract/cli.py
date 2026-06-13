@@ -1818,6 +1818,198 @@ def table_preview(
         typer.echo(f"table-preview: written to {out}", err=True)
 
 
+@app.command("policy-trace")
+def policy_trace(
+    source: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            readable=True,
+            help=(
+                "A PDF (live render -> OCR -> exact dark_ratio, ~1s/page) OR a "
+                "quality-scan .jsonl (per-page boxes/box_coverage, zero OCR, "
+                "seconds for the whole corpus). Pass extra .jsonl with --signals."
+            ),
+        ),
+    ],
+    policy: Annotated[
+        str,
+        typer.Option(
+            "--policy",
+            help=(
+                "Pagefix policy: a built-in name ('default' or 'pagefix-policy') "
+                "or a path to a pagefix-policy YAML. Drives the valve thresholds."
+            ),
+        ),
+    ] = "default",
+    diff: Annotated[
+        str | None,
+        typer.Option(
+            "--diff",
+            help=(
+                "A SECOND policy (name or path). When set, the command traces the "
+                "source under both --policy and --diff and prints only the FLIP "
+                "set: pages whose route differs, with the before/after route + "
+                "reason. Without --diff the full per-page trace JSONL is printed."
+            ),
+        ),
+    ] = None,
+    signals: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--signals",
+            help=(
+                "Extra quality-scan .jsonl files to fold into the corpus fast "
+                "path (repeatable). Ignored when SOURCE is a PDF."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="Trace only the first N pages."),
+    ] = None,
+) -> None:
+    """Mock the four ssPageFix valves' per-page routing under a policy (ssMock).
+
+    Reads a :class:`PagefixPolicy` and, per page, reports the final route
+    (text vs drawing/caption lane) + the firing reason + the driving signals
+    — WITHOUT rendering captions, embedding, or touching any index/cache
+    (pure read; opt-in). Turns "change a threshold, see what flips" from a
+    ~4h re-ingest into a CLI call [DECISION-pm.20].
+
+    Two source modes:
+      * a quality-scan ``.jsonl`` (e.g. the W6 q45d full-scan): the corpus
+        fast path — reads cached boxes/box_coverage, runs ONLY the decision
+        tree, zero OCR. The classify mock is byte-faithful to the framework
+        ``classify_page_v2`` [DECISION-pm.21]; with no ink ratio in the
+        JSONL the box-only convention applies (DECISION-pm.22).
+      * a ``.pdf``: renders each page at the standard 150dpi/q85 geometry,
+        OCRs it (local CPU), and computes the exact ``dark_ratio`` so the
+        trace is exact (slower: ~1s/page).
+
+    Output: per-page JSONL on stdout (one ``{page, route, classify_verdict,
+    reason, signals}`` per line); a one-line summary on stderr (so piping
+    stays clean). With ``--diff`` only the flip set is printed.
+    """
+    from jcontract.impls._pagefix_policy import DEFAULT_POLICY_NAME, load_policy
+    from jcontract.impls._policy_trace import (
+        PageTrace,
+        diff_traces,
+        load_signal_jsonl,
+        trace_page,
+        trace_signals,
+    )
+
+    is_pdf = source.suffix.lower() == ".pdf"
+
+    def _trace(policy_name: str) -> list[PageTrace]:
+        # CLI ergonomics: 'default' is the friendly alias for the built-in
+        # framework default档 (the loader's canonical name is "pagefix-policy");
+        # everything else passes straight through (name or path).
+        if policy_name == "default":
+            policy_name = DEFAULT_POLICY_NAME
+        pol = load_policy(policy_name)
+        if is_pdf:
+            from jcontract.impls._page_classify import _dark_ratio
+            from jcontract.impls._page_geometry import page_geometry
+            from jcontract.impls._pdfium_render import render_pdf_page_jpeg
+            from jcontract.impls.rapidocr_parser import (
+                DEFAULT_DPI,
+                DEFAULT_JPEG_QUALITY,
+                RapidOcrParser,
+                _jpeg_size,
+            )
+
+            # The parser hosts the orientation probe + OCR engine; with v2 ON
+            # the classifier is fed the UPRIGHT frame (ssRT first), matching
+            # the ingest lane the mock reproduces.
+            parser = RapidOcrParser(auto_rotate=pol.rotate)
+            engine = parser._ensure_engine()
+            traces: list[PageTrace] = []
+            page_no = 0
+            while True:
+                page_no += 1
+                if limit is not None and page_no > limit:
+                    break
+                try:
+                    jpeg = render_pdf_page_jpeg(
+                        source, page_no, dpi=DEFAULT_DPI, jpeg_quality=DEFAULT_JPEG_QUALITY
+                    )
+                except IndexError:
+                    break  # past the last page
+                if pol.rotate:
+                    from jcontract.impls._page_orient import rotate_jpeg
+
+                    rot = parser.resolve_rotation(jpeg, page_no, source.name)
+                    if rot:
+                        jpeg = rotate_jpeg(jpeg, rot, jpeg_quality=DEFAULT_JPEG_QUALITY)
+                res = engine(jpeg)
+                n_boxes = 0 if res.boxes is None else len(res.boxes)
+                width, height = _jpeg_size(jpeg)
+                cov = page_geometry(res.boxes if res.boxes is not None else [], width, height)[
+                    "box_coverage"
+                ]
+                dark = _dark_ratio(jpeg)
+                traces.append(trace_page(page_no, n_boxes, cov, dark, pol, jpeg_bytes=jpeg))
+            return traces
+
+        # JSONL fast path.
+        jsonl_paths = [source, *(signals or [])]
+        records = load_signal_jsonl(*jsonl_paths)
+        if limit is not None:
+            records = records[:limit]
+        return list(trace_signals(records, pol))
+
+    if diff is not None:
+        traces_a = _trace(policy)
+        traces_b = _trace(diff)
+        flips = diff_traces(traces_a, traces_b)
+        for flip in flips:
+            typer.echo(
+                json.dumps(
+                    {
+                        "page": flip.page,
+                        "route_a": flip.route_a,
+                        "route_b": flip.route_b,
+                        "reason_a": flip.reason_a,
+                        "reason_b": flip.reason_b,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        draw_a = sum(1 for t in traces_a if t.route == "drawing")
+        draw_b = sum(1 for t in traces_b if t.route == "drawing")
+        typer.echo(
+            f"policy-trace --diff: {source.name}: {len(flips)} flip(s) "
+            f"over {len(traces_a)} page(s); drawing {draw_a} ({policy}) "
+            f"-> {draw_b} ({diff})",
+            err=True,
+        )
+        return
+
+    traces = _trace(policy)
+    for trace in traces:
+        typer.echo(
+            json.dumps(
+                {
+                    "page": trace.page,
+                    "route": trace.route,
+                    "classify_verdict": trace.classify_verdict,
+                    "reason": trace.reason,
+                    "signals": trace.signals,
+                },
+                ensure_ascii=False,
+            )
+        )
+    n_draw = sum(1 for t in traces if t.route == "drawing")
+    typer.echo(
+        f"policy-trace: {source.name}: {len(traces)} page(s), "
+        f"{n_draw} -> drawing/caption, {len(traces) - n_draw} -> text "
+        f"(policy={policy})",
+        err=True,
+    )
+
+
 def main() -> None:
     """Entry point for the `jcontract` console script."""
     # Configure structlog to emit human-friendly logs by default.
