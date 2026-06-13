@@ -1730,6 +1730,18 @@ def table_preview(
             ),
         ),
     ] = False,
+    detect: Annotated[
+        bool,
+        typer.Option(
+            "--detect/--no-detect",
+            help=(
+                "ssTable: localize the table region first (rapid-layout "
+                "PP-LAYOUT-TABLE) and structure ONLY the OCR boxes inside it, "
+                "so a mixed page's letterhead/heading prose is not gridded "
+                "into the first row. Opt-in; default off = whole-page (legacy)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Structure one page's table via rapid-table SLANet-plus (ssTB).
 
@@ -1743,6 +1755,12 @@ def table_preview(
     Result goes to stdout/--out verbatim; the one-line summary goes to
     stderr so piped output stays clean. A page with no detectable table
     structure produces empty output + a stderr notice — not an error.
+
+    With ``--detect`` (opt-in, ssTable) a layout model localizes the table
+    region(s) first and only the OCR boxes inside them are structured, so a
+    mixed page's letterhead/heading prose is no longer absorbed into the
+    first row; if no region is detected it falls through to whole-page
+    structuring. Default ``--no-detect`` is byte-identical legacy behaviour.
     """
     # Lazy imports — rapid-table/rapidocr drag in opencv + onnxruntime;
     # none of that belongs in cold-start for the other commands (same
@@ -1790,6 +1808,29 @@ def table_preview(
     # straight through to the structure engine — no second OCR.
     # [DECISION-tt.30]
     ocr_results = page_ocr_results(jpeg_bytes)
+
+    # ssTable (--detect, opt-in): localize the table region(s) and feed only
+    # the OCR boxes inside them to SLANet, so a mixed page's prose
+    # (letterhead/headings) is not absorbed into the first row. Default off
+    # keeps the legacy whole-page behaviour byte-for-byte. [DECISION-pm.31]
+    n_regions = 0
+    if detect:
+        import io as _io
+
+        from PIL import Image as _Image
+
+        from jcontract.impls._table_detect import (
+            detect_table_regions,
+            filter_ocr_to_regions,
+        )
+
+        regions = detect_table_regions(jpeg_bytes)
+        n_regions = len(regions)
+        if regions:
+            with _Image.open(_io.BytesIO(jpeg_bytes)) as _img:
+                _w, _h = _img.size
+            ocr_results = filter_ocr_to_regions(ocr_results, regions, page_w=_w, page_h=_h)
+
     cells = structure_table(jpeg_bytes, ocr_results)
 
     rendered = (
@@ -1813,6 +1854,8 @@ def table_preview(
         summary = "no table structure detected"
     if rotation:
         summary += f" (frame auto-rotated {rotation}° CCW)"
+    if detect:
+        summary += f" [detect: {n_regions} table region(s)]"
     typer.echo(f"table-preview: {pdf_path.name} p.{page}: {summary}", err=True)
     if out is not None:
         typer.echo(f"table-preview: written to {out}", err=True)

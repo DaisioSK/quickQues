@@ -63,6 +63,20 @@ dependencies = [
     # PP-StructureV3 (194.8MB wheel), pdfplumber/camelot (scanned PDFs
     # have no text layer). [DECISION-tt.20 dev-sprint v6 §13]
     "rapid-table==3.0.2",
+    # Table-region detection (ssTable). PP-LAYOUT-TABLE ONNX on the same CPU
+    # onnxruntime we ship — localizes the table band on a page so SLANet
+    # structures only the table's OCR boxes, not the letterhead/heading prose
+    # (whole-page feed absorbed prose into the first row, recorded in
+    # _table_assemble). Same RapidAI family as rapidocr/rapid-table.
+    # Apache-2.0, OSV clean, 6.7MB pure-python wheel + one-time ~7.5MB onnx;
+    # every transitive dep already present except a numpy 1.26->2.x bump
+    # (verified: rapidocr/rapid-table/fastembed/sentence-transformers all
+    # import and the full gate passes on numpy 2). Live-verified table-region
+    # recall 1.0 on both frozen samples. Rejected: PP-DocLayoutV3 (heavier
+    # multi-class, table-only needs one class), DocLayout-YOLO (also bundled,
+    # comparable but single-class PP-LAYOUT-TABLE is the cleaner fit).
+    # [DECISION-pm.30 dev-sprint v8 §13]
+    "rapid-layout==1.2.1",
     "fastapi>=0.110,<1",
     "uvicorn[standard]>=0.30,<1",
     "pyyaml>=6.0.3",
@@ -154,6 +168,13 @@ ignore_missing_imports = true
 # ModelType enum, result .pred_htmls/.cell_bboxes/.logic_points.
 [[tool.mypy.overrides]]
 module = ["rapid_table", "rapid_table.*"]
+ignore_missing_imports = true
+
+# rapid-layout ships no py.typed marker as of 1.2.1. Thin surface only:
+# RapidLayout(RapidLayoutInput(...)), ModelType enum, result
+# .boxes/.class_names/.scores. Allow untyped imports.
+[[tool.mypy.overrides]]
+module = ["rapid_layout", "rapid_layout.*"]
 ignore_missing_imports = true
 
 # ----- pytest -----
